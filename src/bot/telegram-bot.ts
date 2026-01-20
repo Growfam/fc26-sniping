@@ -134,24 +134,47 @@ export class TelegramBot {
     // /help
     this.bot.command('help', async (ctx) => {
       await ctx.reply(
-        `📖 *Допомога*\n\n` +
-        `*Як почати:*\n` +
+        `📖 Допомога\n\n` +
+        `Як почати:\n` +
         `1️⃣ Додайте EA акаунт через /add_account\n` +
         `2️⃣ Створіть фільтр через /add_filter\n` +
         `3️⃣ Запустіть снайпер через /start_sniper\n\n` +
-        `*Як отримати cookies:*\n` +
+        `Як отримати cookies:\n` +
         `1. Відкрийте Web App EA FC\n` +
-        `2. Натисніть F12 → Network\n` +
+        `2. Натисніть F12 - Network\n` +
         `3. Оновіть сторінку\n` +
-        `4. Знайдіть будь-який запит до fut.ea.com\n` +
+        `4. Знайдіть запит до fut.ea.com\n` +
         `5. Скопіюйте cookies з Headers\n\n` +
-        `*Типи фільтрів:*\n` +
-        `• По гравцю - вкажіть конкретного гравця\n` +
-        `• По критеріям - ліга, клуб, нація тощо\n` +
-        `• Mass snipe - загальні критерії\n\n` +
-        `⚠️ *Увага:* Використовуйте на свій ризик!`,
-        { parse_mode: 'Markdown' }
+        `Типи фільтрів:\n` +
+        `- По гравцю - вкажіть конкретного гравця\n` +
+        `- По критеріям - ліга, клуб, нація\n\n` +
+        `⚠️ Увага: Використовуйте на свій ризик!`
       );
+    });
+
+    // Handle keyboard buttons
+    this.bot.hears('📱 Акаунти', async (ctx) => {
+      await this.showAccounts(ctx);
+    });
+
+    this.bot.hears('🎯 Фільтри', async (ctx) => {
+      await this.showFilters(ctx);
+    });
+
+    this.bot.hears('▶️ Старт', async (ctx) => {
+      await this.startSniper(ctx);
+    });
+
+    this.bot.hears('⏹ Стоп', async (ctx) => {
+      await this.stopSniper(ctx);
+    });
+
+    this.bot.hears('📊 Статус', async (ctx) => {
+      await this.showStatus(ctx);
+    });
+
+    this.bot.hears('📈 Статистика', async (ctx) => {
+      await this.showStats(ctx);
     });
 
     // Handle text messages (for states)
@@ -242,6 +265,17 @@ export class TelegramBot {
           { parse_mode: 'Markdown' }
         );
       }
+    });
+
+    // Add account / filter buttons
+    this.bot.action('add_account', async (ctx) => {
+      await ctx.answerCbQuery();
+      await this.startAddAccount(ctx);
+    });
+
+    this.bot.action('add_filter', async (ctx) => {
+      await ctx.answerCbQuery();
+      await this.startAddFilter(ctx);
     });
 
     // Main menu buttons
