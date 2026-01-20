@@ -852,29 +852,39 @@ export class TelegramBot {
         break;
 
       case 'update_cookies':
-        try {
-          const cookies = JSON.parse(text);
+  try {
+    let sid = text.trim();
 
-          if (!cookies.sid || !cookies.personaId || !cookies.nucleusId) {
-            await ctx.reply(
-              '❌ Невірний формат! Потрібні поля: sid, personaId, nucleusId'
-            );
-            return;
-          }
+    if (text.includes('{')) {
+      const parsed = JSON.parse(text);
+      sid = parsed.sid || parsed['X-UT-SID'] || text;
+    }
 
-          await db.updateEAAccountSession(state.data.accountId, { cookies });
+    const sidRegex = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+    if (!sidRegex.test(sid)) {
+      await ctx.reply(
+        '❌ Невірний формат SID!\n\n' +
+        'SID має виглядати так:\n' +
+        'f1888c19-c261-4e8c-b49e-1e202c4a872f'
+      );
+      return;
+    }
 
-          this.userStates.delete(ctx.from!.id);
+    const cookies = { sid: sid };
 
-          await ctx.reply('✅ Cookies успішно оновлено!');
-        } catch (error) {
-          await ctx.reply(
-            '❌ Невірний формат JSON!\n\n' +
-            'Надішліть у форматі:\n' +
-            '{"sid":"ваш_sid","personaId":"ваш_id","nucleusId":"ваш_nucleus"}'
-          );
-        }
-        break;
+    await db.updateEAAccountSession(state.data.accountId, { cookies });
+
+    this.userStates.delete(ctx.from!.id);
+
+    await ctx.reply('✅ Cookies успішно оновлено!');
+  } catch (error) {
+    await ctx.reply(
+      '❌ Помилка!\n\n' +
+      'Надішліть SID у форматі:\n' +
+      'f1888c19-c261-4e8c-b49e-1e202c4a872f'
+    );
+  }
+  break;
 
       case 'add_filter_name':
         state.data.name = text;
