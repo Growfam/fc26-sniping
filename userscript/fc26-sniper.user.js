@@ -19,14 +19,14 @@
         SUPABASE_KEY: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd2dGhyaXVvcmd2d25lamh3eHpmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzY5NTg0OTksImV4cCI6MjA1MjUzNDQ5OX0.KwVgDI-c_XNSvR8kGbE5oadX-ZGXSj5pCWghNj3gJys',
         TELEGRAM_USER_ID: 7066583465,
 
-        // Затримки (мс)
-        SEARCH_DELAY_MIN: 7000,
-        SEARCH_DELAY_MAX: 15000,
-        BUY_DELAY: 300,
+        // Затримки (мс) - агресивний снайпінг
+        SEARCH_DELAY_MIN: 1000,   // 1 сек між фільтрами
+        SEARCH_DELAY_MAX: 3000,   // 3 сек
+        BUY_DELAY: 100,           // 0.1 сек перед покупкою
 
         // Anti-ban
-        MAX_SEARCHES_PER_HOUR: 200,
-        PAUSE_AFTER_BUY: 30000,
+        MAX_SEARCHES_PER_HOUR: 500,
+        PAUSE_AFTER_BUY: 5000,    // 5 сек після покупки
     };
 
     // ==========================================
@@ -324,14 +324,22 @@
         if (!isRunning) return;
 
         if (searchesThisHour >= CONFIG.MAX_SEARCHES_PER_HOUR) {
-            log('⚠️ Ліміт пошуків. Пауза 10 хв...');
-            await sleep(600000);
+            log('⚠️ Ліміт пошуків. Пауза 5 хв...');
+            await sleep(300000);
             searchesThisHour = 0;
         }
 
         const activeFilters = filters.filter(f => f.is_active);
 
-        for (const filter of activeFilters) {
+        if (activeFilters.length === 0) {
+            log('❌ Немає активних фільтрів');
+            isRunning = false;
+            updateUI();
+            return;
+        }
+
+        for (let i = 0; i < activeFilters.length; i++) {
+            const filter = activeFilters[i];
             if (!isRunning) break;
 
             try {
@@ -339,7 +347,7 @@
                 searchesThisHour++;
                 updateUI();
 
-                log(`🔍 ${filter.player_name || 'Пошук'}...`);
+                log(`🔍 [${i+1}/${activeFilters.length}] ${filter.player_name || 'Пошук'}...`);
                 const items = await searchMarket(filter);
 
                 for (const item of items) {
@@ -347,6 +355,15 @@
 
                     const buyNow = item._auction?.buyNowPrice;
                     if (!buyNow || buyNow > filter.max_buy_price) continue;
+
+                    // ВАЖЛИВО: Перевірка defId якщо вказано в фільтрі
+                    if (filter.player_id) {
+                        const itemDefId = item.definitionId || item._staticData?.id;
+                        if (itemDefId !== filter.player_id) {
+                            log(`⚠️ Пропуск: defId ${itemDefId} != ${filter.player_id}`);
+                            continue;
+                        }
+                    }
 
                     const playerName = item._staticData?.name || 'Гравець';
                     log(`💰 ${playerName} за ${buyNow.toLocaleString()}!`);
@@ -380,13 +397,16 @@
                 log(`❌ ${e.message}`);
             }
 
-            if (isRunning) {
+            // Затримка між фільтрами
+            if (isRunning && i < activeFilters.length - 1) {
                 await sleep(randomDelay(CONFIG.SEARCH_DELAY_MIN, CONFIG.SEARCH_DELAY_MAX));
             }
         }
 
+        // Коротка пауза перед новим циклом
         if (isRunning) {
-            setTimeout(sniperLoop, 1000);
+            await sleep(randomDelay(CONFIG.SEARCH_DELAY_MIN, CONFIG.SEARCH_DELAY_MAX));
+            sniperLoop(); // Наступний цикл
         }
     }
 

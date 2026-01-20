@@ -83,6 +83,13 @@ async function deleteFilter(filterId: string) {
         .eq('id', filterId);
 }
 
+async function updateFilter(filterId: string, updates: any) {
+    await supabase
+        .from('sniper_filters')
+        .update(updates)
+        .eq('id', filterId);
+}
+
 async function getStats(userId: number) {
     const { data } = await supabase
         .from('sniper_stats')
@@ -221,9 +228,12 @@ bot.action(/^info_(.+)$/, async (ctx) => {
                         filter.is_active ? '⏸ Вимкнути' : '▶️ Увімкнути',
                         `toggle_${filterId}`
                     ),
-                    Markup.button.callback('🗑 Видалити', `delete_${filterId}`)
+                    Markup.button.callback('✏️ Редагувати', `edit_${filterId}`)
                 ],
-                [Markup.button.callback('◀️ Назад', 'back_to_filters')]
+                [
+                    Markup.button.callback('🗑 Видалити', `delete_${filterId}`),
+                    Markup.button.callback('◀️ Назад', 'back_to_filters')
+                ]
             ])
         }
     );
@@ -255,6 +265,56 @@ bot.action(/^delete_(.+)$/, async (ctx) => {
 bot.action('back_to_filters', async (ctx) => {
     await ctx.deleteMessage().catch(() => {});
     await showFilters(ctx);
+});
+
+// ==========================================
+// EDIT FILTER
+// ==========================================
+bot.action(/^edit_(.+)$/, async (ctx) => {
+    const filterId = ctx.match[1];
+    await ctx.answerCbQuery();
+
+    await ctx.editMessageText(
+        '✏️ *Що редагувати?*',
+        {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('🆔 Player ID', `edit_id_${filterId}`)],
+                [Markup.button.callback('📝 Назва', `edit_name_${filterId}`)],
+                [Markup.button.callback('💰 Max ціна', `edit_max_${filterId}`)],
+                [Markup.button.callback('💵 Sell ціна', `edit_sell_${filterId}`)],
+                [Markup.button.callback('◀️ Назад', `info_${filterId}`)]
+            ])
+        }
+    );
+});
+
+bot.action(/^edit_id_(.+)$/, async (ctx) => {
+    const filterId = ctx.match[1];
+    userStates.set(ctx.from!.id, { step: 'edit_player_id', filterId });
+    await ctx.answerCbQuery();
+    await ctx.reply('🆔 Введіть новий Player ID (або "-" щоб очистити):');
+});
+
+bot.action(/^edit_name_(.+)$/, async (ctx) => {
+    const filterId = ctx.match[1];
+    userStates.set(ctx.from!.id, { step: 'edit_player_name', filterId });
+    await ctx.answerCbQuery();
+    await ctx.reply('📝 Введіть нову назву:');
+});
+
+bot.action(/^edit_max_(.+)$/, async (ctx) => {
+    const filterId = ctx.match[1];
+    userStates.set(ctx.from!.id, { step: 'edit_max_buy', filterId });
+    await ctx.answerCbQuery();
+    await ctx.reply('💰 Введіть нову максимальну ціну:');
+});
+
+bot.action(/^edit_sell_(.+)$/, async (ctx) => {
+    const filterId = ctx.match[1];
+    userStates.set(ctx.from!.id, { step: 'edit_sell_price', filterId });
+    await ctx.answerCbQuery();
+    await ctx.reply('💵 Введіть нову ціну продажу:');
 });
 
 // ==========================================
@@ -349,6 +409,47 @@ bot.on('text', async (ctx) => {
     }
 
     switch (state.step) {
+        // Edit cases
+        case 'edit_player_id':
+            const newPlayerId = text === '-' ? null : parseInt(text.replace(/\D/g, ''));
+            if (text !== '-' && isNaN(newPlayerId as number)) {
+                await ctx.reply('❌ Невірний ID. Введіть число або "-":');
+                return;
+            }
+            await updateFilter(state.filterId, { player_id: newPlayerId });
+            userStates.delete(ctx.from!.id);
+            await ctx.reply('✅ Player ID оновлено!', mainKeyboard);
+            break;
+
+        case 'edit_player_name':
+            await updateFilter(state.filterId, { player_name: text });
+            userStates.delete(ctx.from!.id);
+            await ctx.reply('✅ Назву оновлено!', mainKeyboard);
+            break;
+
+        case 'edit_max_buy':
+            const newMaxBuy = parseInt(text.replace(/\D/g, ''));
+            if (isNaN(newMaxBuy) || newMaxBuy < 200) {
+                await ctx.reply('❌ Мінімум 200. Спробуйте ще:');
+                return;
+            }
+            await updateFilter(state.filterId, { max_buy_price: newMaxBuy });
+            userStates.delete(ctx.from!.id);
+            await ctx.reply(`✅ Max ціну оновлено: ${newMaxBuy.toLocaleString()}`, mainKeyboard);
+            break;
+
+        case 'edit_sell_price':
+            const newSellPrice = parseInt(text.replace(/\D/g, ''));
+            if (isNaN(newSellPrice)) {
+                await ctx.reply('❌ Невірна ціна. Спробуйте ще:');
+                return;
+            }
+            await updateFilter(state.filterId, { sell_price: newSellPrice });
+            userStates.delete(ctx.from!.id);
+            await ctx.reply(`✅ Sell ціну оновлено: ${newSellPrice.toLocaleString()}`, mainKeyboard);
+            break;
+
+        // Add filter cases
         case 'player_id':
             if (text === '-') {
                 state.player_id = null;
