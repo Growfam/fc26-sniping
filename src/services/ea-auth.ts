@@ -257,7 +257,7 @@ export class EAAuth extends EventEmitter {
   }
 
   // ==========================================
-  // STEP 2: SUBMIT CREDENTIALS
+  // STEP 2: SUBMIT CREDENTIALS (2-step: email first, then password)
   // ==========================================
 
   private async submitCredentials(
@@ -266,10 +266,43 @@ export class EAAuth extends EventEmitter {
     loginUrl: string
   ): Promise<{ success: boolean; requires2FA?: boolean; tfaUrl?: string; error?: string }> {
     try {
-      logger.info(`[EAAuth] Step 2: Submitting credentials to ${loginUrl.substring(0, 60)}...`);
+      logger.info(`[EAAuth] Step 2a: Submitting EMAIL...`);
 
-      // Submit form with credentials
-      const response = await this.client.post(loginUrl, new URLSearchParams({
+      // STEP 2a: Submit EMAIL first
+      const emailResponse = await this.client.post(loginUrl, new URLSearchParams({
+        email,
+        _eventId: 'submit',
+        cid: '',
+        showAgeUp: 'true',
+        googleCaptchaResponse: ''
+      }).toString(), {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Origin': 'https://signin.ea.com',
+          'Referer': loginUrl
+        },
+        maxRedirects: 5
+      });
+
+      const emailHtml = typeof emailResponse.data === 'string' ? emailResponse.data : '';
+      const passwordPageUrl = emailResponse.request?.res?.responseUrl || loginUrl;
+
+      logger.info(`[EAAuth] After email, URL: ${passwordPageUrl.substring(0, 80)}`);
+
+      // Check if still needs password (should have password field now)
+      if (!emailHtml.includes('password') && !passwordPageUrl.includes('s2')) {
+        logger.warn('[EAAuth] No password field found after email submit');
+      }
+
+      // Check for errors
+      if (emailHtml.includes('not find') || emailHtml.includes('does not exist')) {
+        return { success: false, error: 'Email не знайдено в системі EA' };
+      }
+
+      logger.info(`[EAAuth] Step 2b: Submitting PASSWORD...`);
+
+      // STEP 2b: Submit PASSWORD
+      const passResponse = await this.client.post(passwordPageUrl, new URLSearchParams({
         email,
         password,
         _eventId: 'submit',
@@ -282,28 +315,27 @@ export class EAAuth extends EventEmitter {
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
           'Origin': 'https://signin.ea.com',
-          'Referer': loginUrl
+          'Referer': passwordPageUrl
         },
-        maxRedirects: 5,  // Follow redirects after login
-        validateStatus: () => true
+        maxRedirects: 5
       });
 
-      const html = typeof response.data === 'string' ? response.data : '';
-      const location = response.headers?.location || '';
-      const finalUrl = response.request?.res?.responseUrl || '';
+      const html = typeof passResponse.data === 'string' ? passResponse.data : '';
+      const location = passResponse.headers?.location || '';
+      const finalUrl = passResponse.request?.res?.responseUrl || '';
 
-      logger.info(`[EAAuth] Status: ${response.status}, Final URL: ${finalUrl.substring(0, 80)}`);
+      logger.info(`[EAAuth] After password, status: ${passResponse.status}, URL: ${finalUrl.substring(0, 80)}`);
 
       // Success - got access token
       if (finalUrl.includes('access_token=') || location.includes('access_token=')) {
-        logger.info('[EAAuth] ✅ Got access token directly!');
+        logger.info('[EAAuth] ✅ Got access token!');
         return { success: true };
       }
 
       // Need 2FA
       if (finalUrl.includes('/tfa') || location.includes('/tfa') ||
           html.includes('twoFactorCode') || html.includes('security code') ||
-          html.includes('Verify your identity')) {
+          html.includes('Verify your identity') || html.includes('Enter the code')) {
         logger.info('[EAAuth] 2FA required');
 
         const tfaUrl = finalUrl.includes('/tfa') ? finalUrl :
@@ -314,22 +346,23 @@ export class EAAuth extends EventEmitter {
 
       // Error messages
       if (html.includes('Your credentials are incorrect') ||
-          html.includes('credentials') && html.includes('incorrect')) {
-        return { success: false, error: 'Невірний email або пароль' };
+          html.includes('credentials') && html.includes('incorrect') ||
+          html.includes('wrong password')) {
+        return { success: false, error: 'Невірний пароль' };
       }
 
       if (html.includes('locked') || html.includes('suspended') || html.includes('banned')) {
         return { success: false, error: 'Акаунт заблоковано' };
       }
 
-      // Still on login page? Maybe need to submit again or different flow
-      if (finalUrl.includes('signin.ea.com') && html.includes('password')) {
-        logger.warn('[EAAuth] Still on login page after submit');
-        return { success: false, error: 'Не вдалося увійти. Перевірте email/пароль.' };
+      // Still on login page?
+      if (finalUrl.includes('signin.ea.com') && (html.includes('password') || html.includes('login'))) {
+        logger.warn('[EAAuth] Still on login page');
+        logger.info(`[EAAuth] HTML snippet: ${html.substring(0, 500)}`);
+        return { success: false, error: 'Не вдалося увійти. Перевірте пароль.' };
       }
 
-      // Unknown state - try to continue
-      logger.info('[EAAuth] Credentials submitted, continuing...');
+      logger.info('[EAAuth] Credentials submitted successfully');
       return { success: true };
 
     } catch (error: any) {
