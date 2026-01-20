@@ -209,7 +209,7 @@ export class EAAuthService extends EventEmitter {
       return {
         success: true,
         session: this.currentSession,
-        cookies
+        cookies: cookies || undefined
       };
 
     } catch (error: any) {
@@ -361,7 +361,7 @@ export class EAAuthService extends EventEmitter {
         return {
           success: true,
           session: {
-            accessToken: token,
+            accessToken: token || undefined,
             platform: 'pc', // Will be set later
             sid: ''
           }

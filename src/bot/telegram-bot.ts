@@ -804,7 +804,7 @@ export class TelegramBot {
     if ('editMessageText' in ctx) {
       await (ctx as any).editMessageText(text, { parse_mode: 'Markdown', ...keyboard });
     } else {
-      await ctx.reply(text, { parse_mode: 'Markdown', ...keyboard });
+      await (ctx as BotContext).reply(text, { parse_mode: 'Markdown', ...keyboard });
     }
   }
 
@@ -1286,6 +1286,11 @@ export class TelegramBot {
           cookies
         );
 
+        if (!account) {
+          await ctx.reply('❌ Помилка збереження акаунту');
+          return;
+        }
+
         const api = await EAAPIFactory.getInstance(account.id);
         if (api) {
           const credits = await api.getCredits();
@@ -1358,6 +1363,14 @@ export class TelegramBot {
 
     process.once('SIGINT', () => this.bot.stop('SIGINT'));
     process.once('SIGTERM', () => this.bot.stop('SIGTERM'));
+  }
+
+  async launch(): Promise<void> {
+    return this.start();
+  }
+
+  stop(signal?: string): void {
+    this.bot.stop(signal);
   }
 }
 

@@ -347,6 +347,15 @@ class Database {
     return !error;
   }
 
+  async toggleFilter(filterId: string, isActive: boolean): Promise<boolean> {
+    const { error } = await this.client
+      .from('sniper_filters')
+      .update({ is_active: isActive })
+      .eq('id', filterId);
+
+    return !error;
+  }
+
   // ==========================================
   // TRADE HISTORY
   // ==========================================

@@ -238,12 +238,12 @@ class SniperEngine extends EventEmitter {
         const results = await api.search(searchParams);
         session.stats.searches++;
 
-        if (!results || results.length === 0) {
+        if (!results || !results.auctionInfo || results.auctionInfo.length === 0) {
           continue;
         }
 
         // Check for snipes
-        for (const item of results) {
+        for (const item of results.auctionInfo) {
           if (this.isSnipe(item, filter)) {
             await this.attemptPurchase(accountId, item, filter);
           }
