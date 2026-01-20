@@ -791,8 +791,11 @@ export class TelegramBot {
             return;
           }
 
+          await ctx.reply('⏳ Перевіряю SID та отримую баланс...');
+
           const cookies = { sid: sid };
 
+          // Додаємо акаунт
           const account = await db.addEAAccount(
             ctx.user!.id,
             state.data.email,
@@ -800,16 +803,45 @@ export class TelegramBot {
             cookies
           );
 
+          // Перевіряємо SID та отримуємо баланс
+          let coins = 0;
+          let sessionValid = false;
+
+          try {
+            const api = await EAAPIFactory.getInstance(account.id);
+            if (api) {
+              const credits = await api.getCredits();
+              coins = credits.credits;
+              sessionValid = true;
+
+              // Оновлюємо баланс в БД
+              await db.updateEAAccountSession(account.id, { coins: coins });
+            }
+          } catch (apiError) {
+            logger.warn('Could not verify EA session:', apiError);
+          }
+
           this.userStates.delete(ctx.from!.id);
 
-          await ctx.reply(
-            '✅ Акаунт додано!\n\n' +
-            '📧 Email: ' + state.data.email + '\n' +
-            '🎮 Платформа: ' + state.data.platform.toUpperCase() + '\n' +
-            '🔑 SID: ' + sid.substring(0, 8) + '...\n\n' +
-            'Наступний крок - створіть фільтр:\n' +
-            '/add_filter'
-          );
+          if (sessionValid) {
+            await ctx.reply(
+              '✅ Акаунт додано та перевірено!\n\n' +
+              '📧 Email: ' + state.data.email + '\n' +
+              '🎮 Платформа: ' + state.data.platform.toUpperCase() + '\n' +
+              '💰 Баланс: ' + coins.toLocaleString() + ' монет\n' +
+              '🔑 SID: ' + sid.substring(0, 8) + '...\n\n' +
+              'Наступний крок - створіть фільтр:\n' +
+              '/add_filter'
+            );
+          } else {
+            await ctx.reply(
+              '⚠️ Акаунт додано, але SID не вдалося перевірити!\n\n' +
+              '📧 Email: ' + state.data.email + '\n' +
+              '🎮 Платформа: ' + state.data.platform.toUpperCase() + '\n' +
+              '🔑 SID: ' + sid.substring(0, 8) + '...\n\n' +
+              'Можливо SID застарів. Спробуйте оновити через /accounts'
+            );
+          }
         } catch (error) {
           await ctx.reply(
             '❌ Помилка!\n\n' +
