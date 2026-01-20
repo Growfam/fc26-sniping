@@ -1,27 +1,19 @@
 {
   "name": "fc26-sniper-bot",
-  "version": "2.0.0",
-  "description": "FC26 Ultimate Team Sniper Bot with Anti-Ban System",
+  "version": "3.0.0",
+  "description": "FC26 Sniper - Telegram bot for filter management",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "ts-node src/index.ts",
-    "watch": "tsc -w"
+    "dev": "ts-node src/index.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
-    "axios": "^1.6.2",
-    "axios-cookiejar-support": "^5.0.0",
-    "dotenv": "^16.3.1",
-    "puppeteer": "^22.0.0",
-    "telegraf": "^4.15.0",
-    "tough-cookie": "^4.1.3",
-    "winston": "^3.11.0"
+    "telegraf": "^4.15.0"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
-    "@types/tough-cookie": "^4.0.5",
     "typescript": "^5.3.2",
     "ts-node": "^10.9.2"
   },
