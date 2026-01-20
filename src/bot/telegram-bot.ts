@@ -89,8 +89,7 @@ export class TelegramBot {
   // ==========================================
 
   private setupCallbacks(): void {
-    // Platform selection for add account
-    this.bot.action(/^addacc_(.+)$/, (ctx) => this.handleAddAccPlatform(ctx));
+    // Platform selection
     this.bot.action(/^platform_(.+)$/, (ctx) => this.handlePlatformSelect(ctx));
 
     // Account actions
@@ -127,11 +126,7 @@ export class TelegramBot {
 
       switch (state.step) {
         case 'email':
-        case 'sid_email':
           await this.handleEmailInput(ctx as any, text);
-          break;
-        case 'sid_input':
-          await this.handleSidInput(ctx as any, text);
           break;
         case 'password':
           await this.handlePasswordInput(ctx as any, text);
@@ -263,147 +258,58 @@ export class TelegramBot {
   }
 
   // ==========================================
-  // ADD ACCOUNT FLOW (Hybrid - user provides SID)
+  // ADD ACCOUNT FLOW
   // ==========================================
 
   private async startAddAccount(ctx: BotContext): Promise<void> {
     logger.info(`[Bot] /add_account command from ${ctx.from?.id}`);
 
-    const keyboard = Markup.inlineKeyboard([
-      [
-        Markup.button.callback('🎮 PlayStation', 'addacc_ps'),
-        Markup.button.callback('🎮 Xbox', 'addacc_xbox')
-      ],
-      [Markup.button.callback('💻 PC', 'addacc_pc')]
-    ]);
-
-    await ctx.reply(
-      '📱 *Додавання акаунта EA*\n\n' +
-      'Виберіть платформу:',
-      { parse_mode: 'Markdown', ...keyboard }
-    );
-  }
-
-  private async handleAddAccPlatform(ctx: any): Promise<void> {
-    const platform = ctx.match[1] as 'ps' | 'xbox' | 'pc';
-    await ctx.answerCbQuery();
-
     this.userStates.set(ctx.from!.id, {
-      step: 'sid_email',
-      data: { platform }
+      step: 'email',
+      data: {}
     });
 
-    await ctx.editMessageText(
-      '📧 Введіть email вашого EA акаунта:\n\n' +
-      '(потрібен для ідентифікації)'
-    );
+    await ctx.reply('📧 Введіть email вашого EA акаунта:');
   }
 
   private async handleEmailInput(ctx: BotContext, email: string): Promise<void> {
     if (!email.includes('@')) {
-      await ctx.reply('❌ Невірний формат email. Спробуйте ще раз:');
+      await ctx.reply('❌ Невірний формат email');
       return;
     }
 
     const state = this.userStates.get(ctx.from!.id)!;
     state.data.email = email;
-    state.step = 'sid_input';
+    state.step = 'platform';
 
-    await ctx.reply(
-      '🔑 *Як отримати SID:*\n\n' +
-      '1️⃣ Відкрийте в браузері:\n' +
-      'ea.com/ea-sports-fc/ultimate-team/web-app\n\n' +
-      '2️⃣ Залогіньтесь повністю (включно з 2FA)\n\n' +
-      '3️⃣ Натисніть F12 (DevTools)\n\n' +
-      '4️⃣ Вкладка Network → Filter: ut/game\n\n' +
-      '5️⃣ Знайдіть будь-який запит → Headers\n\n' +
-      '6️⃣ Скопіюйте значення X-UT-SID\n\n' +
-      '📝 Вставте SID сюди:'
-    );
-  }
+    const keyboard = Markup.inlineKeyboard([
+      [
+        Markup.button.callback('🎮 PlayStation', 'platform_ps'),
+        Markup.button.callback('🎮 Xbox', 'platform_xbox')
+      ],
+      [Markup.button.callback('💻 PC', 'platform_pc')]
+    ]);
 
-  private async handleSidInput(ctx: BotContext, sid: string): Promise<void> {
-    const state = this.userStates.get(ctx.from!.id);
-    if (!state) return;
-
-    // Basic SID validation
-    if (sid.length < 30) {
-      await ctx.reply('❌ SID занадто короткий. Перевірте і спробуйте ще раз.');
-      return;
-    }
-
-    const { email, platform } = state.data;
-
-    await ctx.reply('⏳ Перевірка SID...');
-
-    try {
-      // Verify SID works
-      const auth = eaAuthManager.getAuth('temp_verify');
-      const isValid = await auth.verifySession(sid, platform);
-
-      if (!isValid) {
-        await ctx.reply(
-          '❌ SID недійсний або застарів.\n\n' +
-          'Переконайтесь що:\n' +
-          '• Ви скопіювали повний SID\n' +
-          '• Web App ще відкритий\n' +
-          '• Пройшло менше 1 години\n\n' +
-          'Спробуйте отримати новий SID.'
-        );
-        return;
-      }
-
-      // Get coins
-      const coins = await auth.getCredits(sid, platform);
-
-      // Save account
-      const account = await db.addEAAccount(
-        ctx.user!.id,
-        email,
-        platform,
-        {
-          sid,
-          platform,
-          createdAt: new Date().toISOString()
-        }
-      );
-
-      if (!account) {
-        await ctx.reply('❌ Помилка збереження акаунту');
-        this.userStates.delete(ctx.from!.id);
-        return;
-      }
-
-      // Update coins
-      await db.updateAccountCoins(account.id, coins);
-
-      this.userStates.delete(ctx.from!.id);
-
-      await ctx.reply(
-        '✅ *Акаунт додано успішно!*\n\n' +
-        `📧 Email: ${email}\n` +
-        `🎮 Платформа: ${platform.toUpperCase()}\n` +
-        `💰 Монети: ${coins.toLocaleString()}\n\n` +
-        'Тепер можете налаштувати снайпер /sniper',
-        { parse_mode: 'Markdown' }
-      );
-
-    } catch (error: any) {
-      logger.error('SID verification error:', error);
-      await ctx.reply(`❌ Помилка: ${error.message}`);
-      this.userStates.delete(ctx.from!.id);
-    }
+    await ctx.reply('🎮 Виберіть платформу:', keyboard);
   }
 
   private async handlePlatformSelect(ctx: any): Promise<void> {
-    // Legacy - redirect to new flow
-    await this.handleAddAccPlatform(ctx);
+    const platform = ctx.match[1] as 'ps' | 'xbox' | 'pc';
+    const state = this.userStates.get(ctx.from!.id);
+
+    if (!state || state.step !== 'platform') {
+      await ctx.answerCbQuery('Сесія застаріла');
+      return;
+    }
+
+    state.data.platform = platform;
+    state.step = 'password';
+
+    await ctx.answerCbQuery();
+    await ctx.reply('🔐 Введіть пароль від EA акаунта:');
   }
 
   private async handlePasswordInput(ctx: BotContext, password: string): Promise<void> {
-    // Legacy - not used in hybrid flow
-    await ctx.reply('Авторизація через пароль тимчасово недоступна. Використайте SID.');
-  }
     const state = this.userStates.get(ctx.from!.id);
     if (!state || state.step !== 'password') return;
 
