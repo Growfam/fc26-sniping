@@ -19,6 +19,9 @@
         SUPABASE_KEY: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd2dGhyaXVvcmd2d25lamh3eHpmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzY5NTg0OTksImV4cCI6MjA1MjUzNDQ5OX0.KwVgDI-c_XNSvR8kGbE5oadX-ZGXSj5pCWghNj3gJys',
         TELEGRAM_USER_ID: 7066583465,
 
+        // Telegram Bot для сповіщень
+        TELEGRAM_BOT_TOKEN: '7957192466:AAGvP5ZaJ8q6AeFZWRFkNdMLnBiKlJggbE0',
+
         // Затримки (мс) - агресивний снайпінг
         SEARCH_DELAY_MIN: 1000,   // 1 сек між фільтрами
         SEARCH_DELAY_MAX: 3000,   // 3 сек
@@ -28,6 +31,83 @@
         MAX_SEARCHES_PER_HOUR: 500,
         PAUSE_AFTER_BUY: 5000,    // 5 сек після покупки
     };
+
+    // ==========================================
+    // TELEGRAM NOTIFICATIONS
+    // ==========================================
+    async function sendTelegram(message) {
+        try {
+            const url = `https://api.telegram.org/bot${CONFIG.TELEGRAM_BOT_TOKEN}/sendMessage`;
+            await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    chat_id: CONFIG.TELEGRAM_USER_ID,
+                    text: message,
+                    parse_mode: 'HTML'
+                })
+            });
+        } catch (e) {
+            console.error('Telegram error:', e);
+        }
+    }
+
+    async function notifyBuy(playerName, price, profit) {
+        await sendTelegram(
+            `✅ <b>КУПЛЕНО!</b>\n\n` +
+            `🎮 ${playerName}\n` +
+            `💰 Ціна: ${price.toLocaleString()}\n` +
+            `📈 Профіт: ~${profit.toLocaleString()}`
+        );
+    }
+
+    async function notifySell(playerName, price) {
+        await sendTelegram(
+            `💵 <b>ВИСТАВЛЕНО НА ПРОДАЖ</b>\n\n` +
+            `🎮 ${playerName}\n` +
+            `💰 Ціна: ${price.toLocaleString()}`
+        );
+    }
+
+    async function notifyError(error) {
+        await sendTelegram(
+            `❌ <b>ПОМИЛКА</b>\n\n` +
+            `${error}`
+        );
+    }
+
+    async function notifyCaptcha() {
+        await sendTelegram(
+            `⚠️ <b>УВАГА! CAPTCHA!</b>\n\n` +
+            `Потрібно вирішити капчу в браузері!\n` +
+            `Снайпер призупинено.`
+        );
+    }
+
+    async function notifyBan() {
+        await sendTelegram(
+            `🚫 <b>УВАГА! МОЖЛИВИЙ БАН!</b>\n\n` +
+            `Виявлено блокування ринку.\n` +
+            `Снайпер зупинено.`
+        );
+    }
+
+    async function notifyStart() {
+        await sendTelegram(
+            `▶️ <b>Снайпер запущено!</b>\n\n` +
+            `🎯 Активних фільтрів: ${filters.filter(f => f.is_active).length}`
+        );
+    }
+
+    async function notifyStop() {
+        await sendTelegram(
+            `⏹️ <b>Снайпер зупинено</b>\n\n` +
+            `📊 Статистика сесії:\n` +
+            `🔍 Пошуків: ${stats.searches}\n` +
+            `✅ Куплено: ${stats.bought}\n` +
+            `💰 Профіт: ${stats.profit.toLocaleString()}`
+        );
+    }
 
     // ==========================================
     // STATE
@@ -309,6 +389,58 @@
         });
     }
 
+    // Відправити карту в Transfer List
+    async function moveToTradePile(item) {
+        return new Promise((resolve, reject) => {
+            try {
+                const services = getServices();
+                if (!services || !services.Item) {
+                    reject(new Error('FUT не завантажено'));
+                    return;
+                }
+
+                services.Item.move(item, 'trade')
+                    .observe(this, function(sender, response) {
+                        if (response.success) {
+                            resolve(true);
+                        } else {
+                            reject(new Error(response.error?.message || 'Move failed'));
+                        }
+                    });
+            } catch (e) {
+                reject(e);
+            }
+        });
+    }
+
+    // Виставити на продаж
+    async function listForSale(item, sellPrice) {
+        return new Promise((resolve, reject) => {
+            try {
+                const services = getServices();
+                if (!services || !services.Item) {
+                    reject(new Error('FUT не завантажено'));
+                    return;
+                }
+
+                const startPrice = sellPrice - 1000; // Різниця 1к
+                const binPrice = sellPrice;
+                const duration = 3600; // 1 година
+
+                services.Item.list(item, startPrice, binPrice, duration)
+                    .observe(this, function(sender, response) {
+                        if (response.success) {
+                            resolve(true);
+                        } else {
+                            reject(new Error(response.error?.message || 'List failed'));
+                        }
+                    });
+            } catch (e) {
+                reject(e);
+            }
+        });
+    }
+
     // ==========================================
     // SNIPER LOGIC
     // ==========================================
@@ -378,6 +510,27 @@
                         stats.profit += profit;
 
                         log(`✅ КУПЛЕНО! +${profit.toLocaleString()}`);
+                        await notifyBuy(playerName, buyNow, profit);
+
+                        // Автопродаж
+                        if (filter.sell_price) {
+                            try {
+                                log(`📦 Переміщую в Transfer List...`);
+                                await sleep(500);
+                                await moveToTradePile(item);
+
+                                log(`💵 Виставляю на продаж: ${(filter.sell_price - 1000).toLocaleString()} / ${filter.sell_price.toLocaleString()}`);
+                                await sleep(500);
+                                await listForSale(item, filter.sell_price);
+
+                                log(`✅ Виставлено на продаж!`);
+                                await notifySell(playerName, filter.sell_price);
+                            } catch (sellErr) {
+                                log(`⚠️ Автопродаж: ${sellErr.message}`);
+                                await notifyError(`Автопродаж ${playerName}: ${sellErr.message}`);
+                            }
+                        }
+
                         await logPurchase(playerName, buyNow, filter.sell_price || buyNow);
                         await saveStats();
 
@@ -395,6 +548,21 @@
             } catch (e) {
                 stats.errors++;
                 log(`❌ ${e.message}`);
+
+                // Детекція капчі або бану
+                const errorMsg = e.message.toLowerCase();
+                if (errorMsg.includes('captcha') || errorMsg.includes('challenge')) {
+                    await notifyCaptcha();
+                    isRunning = false;
+                    updateUI();
+                    return;
+                }
+                if (errorMsg.includes('banned') || errorMsg.includes('403') || errorMsg.includes('blocked') || errorMsg.includes('market is disabled')) {
+                    await notifyBan();
+                    isRunning = false;
+                    updateUI();
+                    return;
+                }
             }
 
             // Затримка між фільтрами
@@ -423,6 +591,7 @@
         isRunning = true;
         log('▶️ Снайпер запущено!');
         updateUI();
+        notifyStart();
         sniperLoop();
     }
 
@@ -431,6 +600,7 @@
         log('⏹️ Снайпер зупинено');
         updateUI();
         saveStats();
+        notifyStop();
     }
 
     // ==========================================
