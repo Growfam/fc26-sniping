@@ -243,21 +243,21 @@ class EAPuppeteerAuth {
         // Try to get from localStorage or sessionStorage
         const keys = ['FUTWebSID', 'sid', 'ut-sid'];
         for (const key of keys) {
-          const val = localStorage.getItem(key) || sessionStorage.getItem(key);
+          const val = (window as any).localStorage?.getItem(key) || (window as any).sessionStorage?.getItem(key);
           if (val) return val;
         }
         return '';
       });
-      
+
       if (sid) {
         logger.info('[PuppeteerAuth] Got SID from storage');
         return sid;
       }
-      
+
       // Alternative: intercept network requests
       logger.warn('[PuppeteerAuth] Could not get SID from storage');
       return '';
-      
+
     } catch (error) {
       logger.error('[PuppeteerAuth] Error getting SID:', error);
       return '';
