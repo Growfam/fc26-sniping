@@ -1,6 +1,6 @@
 /**
  * FC26 Telegram Bot v2.0
- * Only email/password authentication (no SID)
+ * Puppeteer-based authentication for reliable 2FA
  */
 
 import { Telegraf, Context, Markup } from 'telegraf';
@@ -8,6 +8,7 @@ import { config } from '../config';
 import { db, User, EAAccount, SniperFilter } from '../database';
 import { EAAPI, EAAPIFactory } from '../services/ea-api';
 import { eaAuthManager, EACredentials } from '../services/ea-auth';
+import { eaPuppeteerAuth } from '../services/ea-puppeteer-auth';
 import { antiBanService, RiskLevel } from '../services/anti-ban';
 import { logger } from '../utils/logger';
 
@@ -49,9 +50,9 @@ export class TelegramBot {
     // Auth middleware
     this.bot.use(async (ctx, next) => {
       if (!ctx.from) return;
-      
+
       const startTime = Date.now();
-      
+
       try {
         ctx.user = await db.getOrCreateUser(ctx.from.id, ctx.from.username || null);
         await next();
@@ -321,27 +322,22 @@ export class TelegramBot {
     const { email, platform } = state.data;
     const tempId = `temp_${ctx.from!.id}_${Date.now()}`;
 
-    await ctx.reply('⏳ Авторизація в EA...');
-
-    const credentials: EACredentials = { email, password, platform };
+    await ctx.reply('⏳ Авторизація в EA (це може зайняти до 30 сек)...');
 
     try {
-      const result = await eaAuthManager.loginWithCredentials(tempId, credentials);
+      // Use Puppeteer for real browser automation
+      const result = await eaPuppeteerAuth.startLogin(tempId, email, password, platform);
 
       if (result.requires2FA) {
         this.pending2FA.set(ctx.from!.id, tempId);
         state.step = '2fa';
         state.data.tfaTimestamp = Date.now();
-        state.data.tfaUrl = result.tfaUrl;
 
-        // Always show link - user must click SEND CODE
         await ctx.reply(
           '🔐 Потрібен 2FA код\n\n' +
-          '1. Відкрийте посилання:\n' +
-          result.tfaUrl + '\n\n' +
-          '2. Натисніть SEND CODE\n' +
-          '3. Перевірте пошту\n' +
-          '4. Введіть: /2fa КОД\n\n' +
+          '📧 Код надіслано на пошту!\n' +
+          '(перевірте також папку Спам)\n\n' +
+          'Введіть код: /2fa XXXXXX\n\n' +
           'Приклад: /2fa 123456'
         );
         return;
@@ -354,12 +350,47 @@ export class TelegramBot {
       }
 
       // Success - save account
-      await this.saveAccount(ctx, result);
+      await this.saveAccountFromPuppeteer(ctx, result, email, platform);
 
     } catch (error: any) {
       logger.error('Login error:', error);
       this.userStates.delete(ctx.from!.id);
+      await eaPuppeteerAuth.cleanup(tempId);
       await ctx.reply(`❌ Помилка авторизації: ${error.message}`);
+    }
+  }
+
+  private async saveAccountFromPuppeteer(ctx: BotContext, result: any, email: string, platform: string): Promise<void> {
+    try {
+      const account = await db.addEAAccount(
+        ctx.user!.id,
+        email,
+        platform as any,
+        {
+          sid: result.session?.sid || '',
+          accessToken: result.session?.accessToken || '',
+          platform,
+          createdAt: new Date().toISOString()
+        }
+      );
+
+      if (!account) {
+        await ctx.reply('❌ Помилка збереження акаунту');
+        return;
+      }
+
+      this.userStates.delete(ctx.from!.id);
+
+      await ctx.reply(
+        '✅ Акаунт додано успішно!\n\n' +
+        `📧 ${email}\n` +
+        `🎮 ${platform.toUpperCase()}\n\n` +
+        'Тепер можете налаштувати снайпер /sniper'
+      );
+
+    } catch (error: any) {
+      logger.error('Save account error:', error);
+      await ctx.reply(`❌ Помилка: ${error.message}`);
     }
   }
 
@@ -368,8 +399,8 @@ export class TelegramBot {
     const text = message?.text || '';
     const code = text.replace('/2fa', '').trim();
 
-    if (!code) {
-      await ctx.reply('❌ Введіть код: `/2fa 123456`', { parse_mode: 'Markdown' });
+    if (!code || code.length !== 6) {
+      await ctx.reply('❌ Введіть 6-значний код: /2fa 123456');
       return;
     }
 
@@ -379,27 +410,33 @@ export class TelegramBot {
       return;
     }
 
+    const state = this.userStates.get(ctx.from!.id);
+    if (!state) {
+      await ctx.reply('❌ Сесія застаріла');
+      return;
+    }
+
     await ctx.reply('⏳ Перевірка коду...');
 
     try {
-      // Continue login with 2FA code
-      const result = await eaAuthManager.continue2FALogin(tempId, code);
+      // Continue with Puppeteer
+      const result = await eaPuppeteerAuth.continue2FA(tempId, code);
 
       if (!result.success) {
-        await ctx.reply(`❌ Помилка: ${result.error}`);
-        this.pending2FA.delete(ctx.from!.id);
-        this.userStates.delete(ctx.from!.id);
+        await ctx.reply(`❌ ${result.error || 'Невірний код'}`);
         return;
       }
 
       // Success - save account
-      await this.saveAccount(ctx, result);
+      this.pending2FA.delete(ctx.from!.id);
+      await this.saveAccountFromPuppeteer(ctx, result, state.data.email, state.data.platform);
 
     } catch (error: any) {
       logger.error('2FA error:', error);
-      await ctx.reply(`❌ Помилка 2FA: ${error.message}`);
+      await ctx.reply(`❌ Помилка: ${error.message}`);
       this.pending2FA.delete(ctx.from!.id);
       this.userStates.delete(ctx.from!.id);
+      await eaPuppeteerAuth.cleanup(tempId);
     }
   }
 
