@@ -40,11 +40,7 @@ export class TelegramBot {
       try {
         ctx.user = await db.getOrCreateUser(ctx.from.id, ctx.from.username || null);
         
-        // Get user state
-        const state = this.userStates.get(ctx.from.id);
-        if (state) {
-          ctx.state = state;
-        }
+        // State is managed via userStates Map
 
         await next();
       } catch (error) {
