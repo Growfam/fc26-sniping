@@ -1,24 +1,16 @@
 /**
  * FC26 EA Authentication Service
- * 
- * Full authentication flow based on FifaSharp approach:
- * 1. Email + Password login to EA accounts
- * 2. 2FA verification (email/SMS/authenticator)
- * 3. OAuth token acquisition
- * 4. Session ID (X-UT-SID) generation
- * 5. Cookie caching for session persistence
+ * Full email/password authentication with 2FA support
  */
 
-import axios, { AxiosInstance, AxiosResponse } from 'axios';
+import axios, { AxiosInstance } from 'axios';
 import { CookieJar } from 'tough-cookie';
 import { wrapper } from 'axios-cookiejar-support';
 import { logger } from '../utils/logger';
-import { config } from '../config';
-import { db } from '../database';
 import { EventEmitter } from 'events';
 
 // ==========================================
-// TYPES & INTERFACES
+// TYPES
 // ==========================================
 
 export interface EACredentials {
@@ -28,21 +20,17 @@ export interface EACredentials {
 }
 
 export interface EASession {
-  sid: string;           // X-UT-SID - main session token
-  accessToken?: string;  // OAuth access token
-  tokenType?: string;
-  expiresAt?: Date;
+  sid: string;
+  platform: 'ps' | 'xbox' | 'pc';
   personaId?: string;
   nucleusId?: string;
-  pidId?: string;
-  dob?: string;
-  phishingToken?: string;
-  platform: 'ps' | 'xbox' | 'pc';
+  expiresAt?: Date;
 }
 
 export interface AuthCookies {
   sid: string;
-  [key: string]: string;
+  platform: string;
+  createdAt: string;
 }
 
 export interface LoginResult {
@@ -51,65 +39,36 @@ export interface LoginResult {
   cookies?: AuthCookies;
   error?: string;
   requires2FA?: boolean;
+  twoFactorMethod?: string;
 }
 
-export type TwoFactorCodeProvider = () => Promise<string | null>;
-
 // ==========================================
-// EA ENDPOINTS
+// CONSTANTS
 // ==========================================
-
-const EA_ENDPOINTS = {
-  // Authentication
-  LOGIN_PAGE: 'https://www.ea.com/login',
-  ACCOUNTS_AUTH: 'https://accounts.ea.com/connect/auth',
-  ACCOUNTS_TOKEN: 'https://accounts.ea.com/connect/token',
-  
-  // Gateway
-  GATEWAY_IDENTITY: 'https://gateway.ea.com/proxy/identity/pids/me',
-  
-  // FUT/FC specific
-  FUT_WEB_APP: 'https://www.ea.com/ea-sports-fc/ultimate-team/web-app',
-  FUT_AUTH: 'https://www.ea.com/ea-sports-fc/ultimate-team/web-app/auth.html',
-  
-  // Platform-specific UT endpoints
-  UT_PS: 'https://utas.mob.v1.fut.ea.com',
-  UT_XBOX: 'https://utas.mob.v2.fut.ea.com',
-  UT_PC: 'https://utas.mob.v4.fut.ea.com',
-};
 
 const PLATFORM_ENDPOINTS: Record<string, string> = {
-  'ps': EA_ENDPOINTS.UT_PS,
-  'xbox': EA_ENDPOINTS.UT_XBOX,
-  'pc': EA_ENDPOINTS.UT_PC,
+  ps: 'https://utas.mob.v1.fut.ea.com/ut/game/fc26',
+  xbox: 'https://utas.mob.v2.fut.ea.com/ut/game/fc26',
+  pc: 'https://utas.mob.v4.fut.ea.com/ut/game/fc26'
+};
+
+const EA_ENDPOINTS = {
+  LOGIN_PAGE: 'https://signin.ea.com/p/juno/login',
+  LOGIN_SUBMIT: 'https://signin.ea.com/p/juno/login',
+  TWO_FACTOR: 'https://signin.ea.com/p/juno/tfa',
+  ACCOUNTS_AUTH: 'https://accounts.ea.com/connect/auth',
+  GATEWAY: 'https://gateway.ea.com/proxy/identity/pids/me'
 };
 
 // ==========================================
-// EA AUTH SERVICE
+// EA AUTH CLASS
 // ==========================================
 
-export class EAAuthService extends EventEmitter {
+export class EAAuth extends EventEmitter {
   private client: AxiosInstance;
   private cookieJar: CookieJar;
   private currentSession: EASession | null = null;
-  
-  // Browser-like headers
-  private readonly DEFAULT_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Cache-Control': 'no-cache',
-    'Pragma': 'no-cache',
-    'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-    'Sec-Ch-Ua-Mobile': '?0',
-    'Sec-Ch-Ua-Platform': '"Windows"',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-User': '?1',
-    'Upgrade-Insecure-Requests': '1',
-  };
+  private accessToken: string | null = null;
 
   constructor() {
     super();
@@ -117,702 +76,550 @@ export class EAAuthService extends EventEmitter {
     this.client = wrapper(axios.create({
       jar: this.cookieJar,
       withCredentials: true,
+      maxRedirects: 5,
       timeout: 30000,
-      maxRedirects: 10,
-      headers: this.DEFAULT_HEADERS,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+      }
     }));
   }
 
   // ==========================================
-  // MAIN LOGIN METHODS
+  // MAIN LOGIN METHOD
   // ==========================================
 
-  /**
-   * Full login with email/password and 2FA
-   * Based on FifaSharp TryLoginAsync
-   */
-  async loginWithCredentials(
+  async login(
     credentials: EACredentials,
-    get2FACode: TwoFactorCodeProvider,
-    onCookiesCached?: (cookies: AuthCookies) => void
+    twoFactorProvider?: () => Promise<string | null>
   ): Promise<LoginResult> {
     try {
       logger.info(`[EAAuth] Starting login for ${credentials.email}`);
 
-      // Step 1: Initialize session and get login page
-      await this.initializeSession();
+      // Step 1: Get login page and extract form data
+      const loginPageResult = await this.getLoginPage();
+      if (!loginPageResult.success) {
+        return loginPageResult;
+      }
 
       // Step 2: Submit credentials
-      const loginResult = await this.submitCredentials(
-        credentials.email, 
-        credentials.password
+      const submitResult = await this.submitCredentials(
+        credentials.email,
+        credentials.password,
+        loginPageResult.formData!
       );
 
-      if (!loginResult.success) {
-        return loginResult;
+      if (!submitResult.success) {
+        return submitResult;
       }
 
       // Step 3: Handle 2FA if required
-      if (loginResult.requires2FA) {
-        logger.info(`[EAAuth] 2FA required`);
-        this.emit('2fa_required', {});
-
-        const code = await get2FACode();
-        if (!code) {
+      if (submitResult.requires2FA) {
+        logger.info(`[EAAuth] 2FA required, method: ${submitResult.twoFactorMethod}`);
+        
+        if (!twoFactorProvider) {
           return {
             success: false,
-            error: '2FA code not provided'
+            requires2FA: true,
+            twoFactorMethod: submitResult.twoFactorMethod,
+            error: 'Потрібен 2FA код. Використайте /2fa <код>'
           };
         }
 
-        const twoFAResult = await this.submit2FACode(code);
-        if (!twoFAResult.success) {
-          return twoFAResult;
+        const code = await twoFactorProvider();
+        if (!code) {
+          return { success: false, error: '2FA код не надано або timeout' };
+        }
+
+        const tfaResult = await this.submit2FA(code, submitResult.formData!);
+        if (!tfaResult.success) {
+          return tfaResult;
         }
       }
 
-      // Step 4: Get OAuth token
-      const tokenResult = await this.getAccessToken(credentials.platform);
+      // Step 4: Get access token
+      const tokenResult = await this.getAccessToken();
       if (!tokenResult.success) {
         return tokenResult;
       }
 
-      // Step 5: Get persona and nucleus IDs
+      this.accessToken = tokenResult.accessToken!;
+
+      // Step 5: Get persona ID
       const identityResult = await this.getIdentity();
       if (!identityResult.success) {
         return identityResult;
       }
 
-      // Step 6: Authenticate to FUT/FC
-      const futAuthResult = await this.authenticateToFUT(credentials.platform);
-      if (!futAuthResult.success) {
-        return futAuthResult;
+      // Step 6: Authenticate to FUT
+      const futResult = await this.authenticateToFUT(credentials.platform, identityResult.personaId!);
+      if (!futResult.success) {
+        return futResult;
       }
 
-      // Build final session
+      // Build session
       this.currentSession = {
-        sid: futAuthResult.session!.sid,
-        accessToken: tokenResult.session!.accessToken,
-        personaId: identityResult.session!.personaId,
-        nucleusId: identityResult.session!.nucleusId,
+        sid: futResult.sid!,
         platform: credentials.platform,
+        personaId: identityResult.personaId,
+        nucleusId: identityResult.nucleusId,
+        expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000)
       };
 
-      // Cache cookies if callback provided
-      const cookies = this.getLoginCookies();
-      if (onCookiesCached && cookies) {
-        onCookiesCached(cookies);
-      }
+      const cookies: AuthCookies = {
+        sid: futResult.sid!,
+        platform: credentials.platform,
+        createdAt: new Date().toISOString()
+      };
 
       logger.info(`[EAAuth] Login successful for ${credentials.email}`);
 
       return {
         success: true,
         session: this.currentSession,
-        cookies: cookies || undefined
+        cookies
       };
 
     } catch (error: any) {
-      logger.error(`[EAAuth] Login failed:`, error);
+      logger.error(`[EAAuth] Login error:`, error.message);
       return {
         success: false,
-        error: error.message || 'Unknown login error'
+        error: `Помилка авторизації: ${error.message}`
       };
     }
   }
 
-  /**
-   * Login using cached cookies (FifaSharp pattern)
-   * Skips email/password/2FA if cookies are still valid
-   */
-  async loginWithCookies(
-    cookies: AuthCookies,
-    platform: 'ps' | 'xbox' | 'pc'
-  ): Promise<LoginResult> {
+  // ==========================================
+  // STEP 1: GET LOGIN PAGE
+  // ==========================================
+
+  private async getLoginPage(): Promise<{ success: boolean; formData?: any; error?: string }> {
     try {
-      logger.info(`[EAAuth] Attempting login with cached cookies`);
+      const response = await this.client.get(EA_ENDPOINTS.LOGIN_PAGE, {
+        params: {
+          client_id: 'FC26_JS_WEB_APP',
+          redirect_uri: 'https://www.ea.com/ea-sports-fc/ultimate-team/web-app/auth.html',
+          response_type: 'token',
+          locale: 'en_US'
+        }
+      });
 
-      // Restore cookies to jar
-      await this.restoreCookies(cookies);
+      const html = response.data;
+      const csrfMatch = html.match(/name="_csrf"\s+value="([^"]+)"/);
+      const executionMatch = html.match(/name="execution"\s+value="([^"]+)"/);
 
-      // Verify session is still valid
-      const verifyResult = await this.verifySession(platform);
-      
-      if (verifyResult.success) {
-        this.currentSession = {
-          sid: cookies.sid,
-          platform,
-          ...verifyResult.session
-        };
-
-        logger.info(`[EAAuth] Cookie login successful`);
-        return {
-          success: true,
-          session: this.currentSession,
-          cookies
-        };
+      if (!csrfMatch) {
+        return { success: false, error: 'Не вдалося отримати CSRF token' };
       }
 
-      logger.warn(`[EAAuth] Cookie login failed - session expired`);
       return {
-        success: false,
-        error: 'Session expired. Please login with credentials.'
+        success: true,
+        formData: {
+          _csrf: csrfMatch[1],
+          execution: executionMatch ? executionMatch[1] : undefined
+        }
       };
-
     } catch (error: any) {
-      logger.error(`[EAAuth] Cookie login error:`, error);
-      return {
-        success: false,
-        error: error.message || 'Cookie login failed'
-      };
+      return { success: false, error: `Помилка завантаження: ${error.message}` };
     }
   }
 
   // ==========================================
-  // AUTHENTICATION STEPS
+  // STEP 2: SUBMIT CREDENTIALS
   // ==========================================
 
-  /**
-   * Step 1: Initialize session
-   */
-  private async initializeSession(): Promise<void> {
-    // Clear old cookies
-    this.cookieJar = new CookieJar();
-    this.client = wrapper(axios.create({
-      jar: this.cookieJar,
-      withCredentials: true,
-      timeout: 30000,
-      maxRedirects: 10,
-      headers: this.DEFAULT_HEADERS,
-    }));
-
-    // Visit login page to get initial cookies
-    await this.client.get(EA_ENDPOINTS.LOGIN_PAGE);
-    
-    logger.debug(`[EAAuth] Session initialized`);
-  }
-
-  /**
-   * Step 2: Submit email and password
-   */
   private async submitCredentials(
-    email: string, 
-    password: string
-  ): Promise<LoginResult> {
+    email: string,
+    password: string,
+    formData: any
+  ): Promise<{ success: boolean; requires2FA?: boolean; twoFactorMethod?: string; formData?: any; error?: string }> {
     try {
-      // EA uses OAuth2 flow
-      const authParams = new URLSearchParams({
-        client_id: 'FC26_JS_WEB_APP',
-        response_type: 'token',
-        redirect_uri: EA_ENDPOINTS.FUT_AUTH,
-        locale: 'en_US',
-        prompt: 'login',
-        display: 'web2/login'
-      });
-
-      const authUrl = `${EA_ENDPOINTS.ACCOUNTS_AUTH}?${authParams.toString()}`;
-      
-      // Get login form
-      const loginPageResponse = await this.client.get(authUrl, {
-        maxRedirects: 5
-      });
-
-      // Extract form data and submit
-      const formData = new URLSearchParams({
-        email: email,
-        password: password,
-        _eventId: 'submit',
-        cid: this.extractCid(loginPageResponse.data),
-        showAgeUp: 'true',
-        thirdPartyCaptchaResponse: '',
-        _rememberMe: 'on',
-      });
-
-      // Find the actual login URL from the response
-      const loginUrl = this.extractLoginUrl(loginPageResponse.data) || 
-                       loginPageResponse.request.res.responseUrl;
-
-      const loginResponse = await this.client.post(loginUrl, formData.toString(), {
+      const response = await this.client.post(EA_ENDPOINTS.LOGIN_SUBMIT, new URLSearchParams({
+        email,
+        password,
+        _csrf: formData._csrf,
+        execution: formData.execution || '',
+        _eventId: 'submit'
+      }).toString(), {
         headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Referer': authUrl,
+          'Content-Type': 'application/x-www-form-urlencoded'
         },
         maxRedirects: 0,
-        validateStatus: (status) => status < 500,
+        validateStatus: (status) => status < 500
       });
 
-      // Check response
-      const responseUrl = loginResponse.headers.location || '';
-      const responseData = loginResponse.data || '';
+      const responseUrl = response.request?.res?.responseUrl || response.headers?.location || '';
+      const html = typeof response.data === 'string' ? response.data : '';
 
-      // Check for 2FA requirement
-      if (responseUrl.includes('tfa') || 
-          responseData.includes('twoFactorCode') ||
-          responseData.includes('verification')) {
-        return {
-          success: true,
-          requires2FA: true
-        };
-      }
-
-      // Check for successful auth redirect
-      if (responseUrl.includes('access_token=')) {
-        const token = this.extractAccessToken(responseUrl);
-        return {
-          success: true,
-          session: {
-            accessToken: token || undefined,
-            platform: 'pc', // Will be set later
-            sid: ''
-          }
-        };
-      }
-
-      // Check for errors
-      if (responseData.includes('error') || responseData.includes('invalid')) {
-        return {
-          success: false,
-          error: 'Invalid email or password'
-        };
-      }
-
-      return { success: true };
-
-    } catch (error: any) {
-      return {
-        success: false,
-        error: `Credential submission failed: ${error.message}`
-      };
-    }
-  }
-
-  /**
-   * Step 3: Submit 2FA code
-   */
-  private async submit2FACode(code: string): Promise<LoginResult> {
-    try {
-      const formData = new URLSearchParams({
-        oneTimeCode: code,
-        _eventId: 'submit',
-        _trustThisDevice: 'on',
-      });
-
-      const response = await this.client.post(
-        'https://signin.ea.com/p/web2/twoFactorSubmit',
-        formData.toString(),
-        {
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-          maxRedirects: 0,
-          validateStatus: (status) => status < 500,
-        }
-      );
-
-      const responseUrl = response.headers.location || '';
-
+      // Check for successful redirect
       if (responseUrl.includes('access_token=')) {
         return { success: true };
       }
 
-      if (response.data?.includes('error') || response.data?.includes('invalid')) {
+      // Check for 2FA page
+      if (html.includes('tfa') || html.includes('two-factor') || html.includes('security-code') || 
+          html.includes('Введіть код') || html.includes('Enter code') || responseUrl.includes('tfa')) {
+        const csrfMatch = html.match(/name="_csrf"\s+value="([^"]+)"/);
+        
         return {
-          success: false,
-          error: 'Invalid 2FA code'
+          success: true,
+          requires2FA: true,
+          twoFactorMethod: 'email',
+          formData: {
+            _csrf: csrfMatch ? csrfMatch[1] : formData._csrf
+          }
         };
+      }
+
+      // Check for invalid credentials
+      if (html.includes('incorrect') || html.includes('invalid') || html.includes('wrong') || 
+          html.includes('Невірний') || html.includes('помилка')) {
+        return { success: false, error: 'Невірний email або пароль' };
+      }
+
+      // Check for account issues
+      if (html.includes('locked') || html.includes('suspended') || html.includes('заблоков')) {
+        return { success: false, error: 'Акаунт заблоковано' };
+      }
+
+      // Follow redirect if needed
+      if (response.status === 302 || response.status === 303) {
+        const location = response.headers.location;
+        if (location) {
+          if (location.includes('tfa')) {
+            return {
+              success: true,
+              requires2FA: true,
+              twoFactorMethod: 'email',
+              formData
+            };
+          }
+          const followResponse = await this.client.get(location);
+          if (followResponse.request?.res?.responseUrl?.includes('access_token=')) {
+            return { success: true };
+          }
+        }
       }
 
       return { success: true };
 
     } catch (error: any) {
-      return {
-        success: false,
-        error: `2FA submission failed: ${error.message}`
-      };
+      if (error.response?.status === 302) {
+        const location = error.response.headers?.location || '';
+        if (location.includes('access_token=')) {
+          return { success: true };
+        }
+        if (location.includes('tfa')) {
+          return {
+            success: true,
+            requires2FA: true,
+            twoFactorMethod: 'email',
+            formData
+          };
+        }
+      }
+      return { success: false, error: `Помилка входу: ${error.message}` };
     }
   }
 
-  /**
-   * Step 4: Get OAuth access token
-   */
-  private async getAccessToken(platform: string): Promise<LoginResult> {
+  // ==========================================
+  // STEP 3: SUBMIT 2FA
+  // ==========================================
+
+  private async submit2FA(
+    code: string,
+    formData: any
+  ): Promise<{ success: boolean; error?: string }> {
     try {
-      const authParams = new URLSearchParams({
-        client_id: 'FC26_JS_WEB_APP',
-        response_type: 'token',
-        redirect_uri: EA_ENDPOINTS.FUT_AUTH,
-        locale: 'en_US',
+      const response = await this.client.post(EA_ENDPOINTS.TWO_FACTOR, new URLSearchParams({
+        oneTimeCode: code,
+        _csrf: formData._csrf,
+        _trustThisDevice: 'on',
+        _eventId: 'submit'
+      }).toString(), {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        maxRedirects: 5,
+        validateStatus: (status) => status < 500
       });
 
-      const response = await this.client.get(
-        `${EA_ENDPOINTS.ACCOUNTS_AUTH}?${authParams.toString()}`,
-        {
-          maxRedirects: 10,
-          validateStatus: () => true,
-        }
-      );
+      const html = typeof response.data === 'string' ? response.data : '';
+      const responseUrl = response.request?.res?.responseUrl || '';
 
-      // Extract token from redirect URL or response
+      if (responseUrl.includes('access_token=') || response.status === 200) {
+        return { success: true };
+      }
+
+      if (html.includes('incorrect') || html.includes('invalid') || html.includes('wrong')) {
+        return { success: false, error: 'Невірний 2FA код' };
+      }
+
+      return { success: true };
+
+    } catch (error: any) {
+      return { success: false, error: `Помилка 2FA: ${error.message}` };
+    }
+  }
+
+  // ==========================================
+  // STEP 4: GET ACCESS TOKEN
+  // ==========================================
+
+  private async getAccessToken(): Promise<{ success: boolean; accessToken?: string; error?: string }> {
+    try {
+      const response = await this.client.get(EA_ENDPOINTS.ACCOUNTS_AUTH, {
+        params: {
+          client_id: 'FC26_JS_WEB_APP',
+          redirect_uri: 'https://www.ea.com/ea-sports-fc/ultimate-team/web-app/auth.html',
+          response_type: 'token',
+          locale: 'en_US'
+        },
+        maxRedirects: 10
+      });
+
       const finalUrl = response.request?.res?.responseUrl || '';
-      const accessToken = this.extractAccessToken(finalUrl);
+      const tokenMatch = finalUrl.match(/access_token=([^&]+)/);
+      
+      if (tokenMatch) {
+        return { success: true, accessToken: tokenMatch[1] };
+      }
 
-      if (!accessToken) {
+      if (response.data?.access_token) {
+        return { success: true, accessToken: response.data.access_token };
+      }
+
+      return { success: false, error: 'Не вдалося отримати access token. Перевірте логін/пароль.' };
+
+    } catch (error: any) {
+      const location = error.response?.headers?.location || '';
+      const tokenMatch = location.match(/access_token=([^&]+)/);
+      if (tokenMatch) {
+        return { success: true, accessToken: tokenMatch[1] };
+      }
+      return { success: false, error: `Помилка токена: ${error.message}` };
+    }
+  }
+
+  // ==========================================
+  // STEP 5: GET IDENTITY
+  // ==========================================
+
+  private async getIdentity(): Promise<{ success: boolean; personaId?: string; nucleusId?: string; error?: string }> {
+    try {
+      const response = await this.client.get(EA_ENDPOINTS.GATEWAY, {
+        headers: {
+          'Authorization': `Bearer ${this.accessToken}`,
+          'Accept': 'application/json'
+        }
+      });
+
+      const pid = response.data?.pid;
+      if (pid) {
         return {
-          success: false,
-          error: 'Failed to obtain access token'
+          success: true,
+          personaId: pid.personaId?.toString() || pid.pidId?.toString(),
+          nucleusId: pid.nucleusId?.toString() || pid.externalRefValue
         };
       }
 
-      return {
-        success: true,
-        session: {
-          accessToken,
-          platform: platform as 'ps' | 'xbox' | 'pc',
-          sid: ''
-        }
-      };
+      return { success: false, error: 'Не вдалося отримати persona ID' };
 
     } catch (error: any) {
-      return {
-        success: false,
-        error: `Token acquisition failed: ${error.message}`
-      };
+      return { success: false, error: `Помилка identity: ${error.message}` };
     }
   }
 
-  /**
-   * Step 5: Get user identity (persona, nucleus IDs)
-   */
-  private async getIdentity(): Promise<LoginResult> {
-    try {
-      const response = await this.client.get(EA_ENDPOINTS.GATEWAY_IDENTITY, {
-        headers: {
-          'Accept': 'application/json',
-        }
-      });
+  // ==========================================
+  // STEP 6: AUTHENTICATE TO FUT
+  // ==========================================
 
-      const data = response.data;
-
-      return {
-        success: true,
-        session: {
-          personaId: data.pid?.pidId,
-          nucleusId: data.pid?.externalRefValue,
-          platform: 'pc' as const,
-          sid: ''
-        }
-      };
-
-    } catch (error: any) {
-      return {
-        success: false,
-        error: `Identity fetch failed: ${error.message}`
-      };
-    }
-  }
-
-  /**
-   * Step 6: Authenticate to FUT/FC and get SID
-   */
-  private async authenticateToFUT(platform: 'ps' | 'xbox' | 'pc'): Promise<LoginResult> {
+  private async authenticateToFUT(
+    platform: 'ps' | 'xbox' | 'pc',
+    personaId: string
+  ): Promise<{ success: boolean; sid?: string; error?: string }> {
     try {
       const baseUrl = PLATFORM_ENDPOINTS[platform];
       
-      // Get user accounts
-      const accountsResponse = await this.client.get(
-        `${baseUrl}/ut/game/fc26/user/accountinfo`,
-        {
-          headers: {
-            'Accept': 'application/json',
-            'Easw-Session-Data-Nucleus-Id': this.currentSession?.nucleusId || '',
-          }
-        }
-      );
-
       // Authenticate
-      const authResponse = await this.client.post(
-        `${baseUrl}/ut/auth?client=webcomp`,
-        {
-          isReadOnly: false,
-          sku: 'FUT26WEB',
-          clientVersion: 1,
-        },
-        {
-          headers: {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-          }
+      const authResponse = await this.client.post(`${baseUrl}/auth`, {
+        isReadOnly: false,
+        sku: 'FUT26WEB',
+        clientVersion: 1,
+        locale: 'en-US',
+        method: 'authcode',
+        priorityLevel: 4,
+        identification: {
+          authCode: '',
+          redirectUrl: 'nucleus:rest'
         }
-      );
+      }, {
+        headers: {
+          'Authorization': `Bearer ${this.accessToken}`,
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          'X-UT-Embed-Error': 'true',
+          'Easw-Session-Data-Nucleus-Id': personaId
+        }
+      });
 
-      const sid = authResponse.data?.sid;
-
-      if (!sid) {
-        return {
-          success: false,
-          error: 'Failed to obtain session ID'
-        };
+      if (authResponse.data?.sid) {
+        return { success: true, sid: authResponse.data.sid };
       }
 
-      return {
-        success: true,
-        session: {
-          sid,
-          platform,
-        }
-      };
+      return { success: false, error: 'Не вдалося отримати SID від EA' };
 
     } catch (error: any) {
-      return {
-        success: false,
-        error: `FUT authentication failed: ${error.message}`
-      };
+      const status = error.response?.status;
+      const data = error.response?.data;
+      
+      if (status === 401) {
+        return { success: false, error: 'Сесія недійсна. Спробуйте ще раз.' };
+      }
+      if (status === 426) {
+        return { success: false, error: '⚠️ Потрібна капча. Відкрийте https://www.ea.com/ea-sports-fc/ultimate-team/web-app/ в браузері, пройдіть капчу, потім спробуйте знову.' };
+      }
+      if (status === 458) {
+        return { success: false, error: '🔒 Ринок заблоковано. Зіграйте 10+ матчів в FC26.' };
+      }
+      if (status === 461) {
+        return { success: false, error: 'Немає доступу до FUT. Перевірте чи є FC26 на цьому акаунті.' };
+      }
+      if (status === 500 || status === 503) {
+        return { success: false, error: 'Сервери EA недоступні. Спробуйте пізніше.' };
+      }
+
+      logger.error(`[EAAuth] FUT auth error:`, { status, data, message: error.message });
+      return { success: false, error: `Помилка FUT: ${data?.message || error.message}` };
     }
   }
 
   // ==========================================
-  // SESSION VERIFICATION
+  // SESSION METHODS
   // ==========================================
 
-  /**
-   * Verify if current session is valid
-   */
-  private async verifySession(platform: 'ps' | 'xbox' | 'pc'): Promise<LoginResult> {
+  async verifySession(sid: string, platform: 'ps' | 'xbox' | 'pc'): Promise<boolean> {
     try {
       const baseUrl = PLATFORM_ENDPOINTS[platform];
-      const sid = this.currentSession?.sid || this.getLoginCookies()?.sid;
-
-      if (!sid) {
-        return {
-          success: false,
-          error: 'No SID available'
-        };
-      }
-
-      const response = await this.client.get(
-        `${baseUrl}/ut/game/fc26/user/credits`,
-        {
-          headers: {
-            'Accept': 'application/json',
-            'X-UT-SID': sid,
-          }
-        }
-      );
-
-      if (response.data?.credits !== undefined) {
-        return {
-          success: true,
-          session: {
-            sid,
-            platform,
-          }
-        };
-      }
-
-      return {
-        success: false,
-        error: 'Session verification failed'
-      };
-
-    } catch (error: any) {
-      return {
-        success: false,
-        error: `Session verification error: ${error.message}`
-      };
+      const response = await this.client.get(`${baseUrl}/user/accountinfo`, {
+        headers: { 'X-UT-SID': sid },
+        validateStatus: () => true
+      });
+      return response.status === 200;
+    } catch {
+      return false;
     }
   }
 
-  // ==========================================
-  // COOKIE MANAGEMENT
-  // ==========================================
-
-  /**
-   * Get current login cookies for caching
-   */
-  getLoginCookies(): AuthCookies | null {
+  async getCredits(sid: string, platform: 'ps' | 'xbox' | 'pc'): Promise<number> {
     try {
-      const cookies = this.cookieJar.toJSON();
-      const cookieMap: AuthCookies = { sid: '' };
-
-      for (const cookie of cookies.cookies) {
-        cookieMap[cookie.key] = cookie.value;
-        
-        // Look for session ID
-        if (cookie.key.toLowerCase().includes('sid') || 
-            cookie.key === 'UT-SID' ||
-            cookie.key === 'X-UT-SID') {
-          cookieMap.sid = cookie.value;
-        }
-      }
-
-      // Add SID from current session if available
-      if (this.currentSession?.sid) {
-        cookieMap.sid = this.currentSession.sid;
-      }
-
-      return cookieMap.sid ? cookieMap : null;
-    } catch (error) {
-      logger.error('[EAAuth] Failed to get login cookies:', error);
-      return null;
+      const baseUrl = PLATFORM_ENDPOINTS[platform];
+      const response = await this.client.get(`${baseUrl}/user/credits`, {
+        headers: { 'X-UT-SID': sid }
+      });
+      return response.data?.credits || 0;
+    } catch {
+      return 0;
     }
   }
 
-  /**
-   * Restore cookies from cache
-   */
-  private async restoreCookies(cookies: AuthCookies): Promise<void> {
-    const domains = ['.ea.com', '.fut.ea.com'];
-    
-    for (const [key, value] of Object.entries(cookies)) {
-      for (const domain of domains) {
-        try {
-          await this.cookieJar.setCookie(
-            `${key}=${value}; Domain=${domain}; Path=/`,
-            `https://${domain.replace('.', '')}`
-          );
-        } catch (e) {
-          // Ignore invalid cookie errors
-        }
-      }
-    }
-  }
-
-  // ==========================================
-  // UTILITY METHODS
-  // ==========================================
-
-  /**
-   * Extract CID from login page
-   */
-  private extractCid(html: string): string {
-    const match = html.match(/name="cid"\s+value="([^"]+)"/);
-    return match ? match[1] : '';
-  }
-
-  /**
-   * Extract login URL from page
-   */
-  private extractLoginUrl(html: string): string | null {
-    const match = html.match(/action="([^"]+)"/);
-    return match ? match[1] : null;
-  }
-
-  /**
-   * Extract access token from URL
-   */
-  private extractAccessToken(url: string): string | null {
-    const match = url.match(/access_token=([^&]+)/);
-    return match ? match[1] : null;
-  }
-
-  /**
-   * Get current session
-   */
   getCurrentSession(): EASession | null {
     return this.currentSession;
   }
 
-  /**
-   * Clear session
-   */
   clearSession(): void {
     this.currentSession = null;
+    this.accessToken = null;
     this.cookieJar = new CookieJar();
-    logger.info('[EAAuth] Session cleared');
   }
 }
 
 // ==========================================
-// EA AUTH MANAGER
+// EA AUTH MANAGER (Singleton)
 // ==========================================
 
-/**
- * Manages EA authentication for multiple accounts
- */
-export class EAAuthManager {
-  private authService: EAAuthService;
-  private sessions: Map<string, EASession> = new Map();
+class EAAuthManager {
+  private authInstances: Map<string, EAAuth> = new Map();
+  private pending2FA: Map<string, {
+    auth: EAAuth;
+    credentials: EACredentials;
+    resolve: (code: string) => void;
+  }> = new Map();
 
-  constructor() {
-    this.authService = new EAAuthService();
+  getAuth(accountId: string): EAAuth {
+    if (!this.authInstances.has(accountId)) {
+      this.authInstances.set(accountId, new EAAuth());
+    }
+    return this.authInstances.get(accountId)!;
   }
 
-  /**
-   * Login with email/password
-   */
-  async login(
-    accountId: string,
-    credentials: EACredentials,
-    get2FACode: TwoFactorCodeProvider
+  async loginWithCredentials(
+    tempId: string,
+    credentials: EACredentials
   ): Promise<LoginResult> {
-    const result = await this.authService.loginWithCredentials(
-      credentials,
-      get2FACode,
-      async (cookies) => {
-        // Save cookies to database
-        await db.updateEAAccountSession(accountId, { cookies });
-      }
-    );
+    const auth = new EAAuth();
+    this.authInstances.set(tempId, auth);
 
-    if (result.success && result.session) {
-      this.sessions.set(accountId, result.session);
-    }
+    return new Promise((resolve) => {
+      const twoFactorProvider = (): Promise<string | null> => {
+        return new Promise((tfaResolve) => {
+          this.pending2FA.set(tempId, {
+            auth,
+            credentials,
+            resolve: tfaResolve
+          });
 
-    return result;
-  }
+          // Emit event for bot to ask user for 2FA
+          auth.emit('2fa_required', { tempId, method: 'email' });
 
-  /**
-   * Login with cached session
-   */
-  async loginWithCache(accountId: string, platform: 'ps' | 'xbox' | 'pc'): Promise<LoginResult> {
-    const accountData = await db.getEAAccountWithCookies(accountId);
-    
-    if (!accountData) {
-      return {
-        success: false,
-        error: 'Account not found'
+          // Timeout after 5 minutes
+          setTimeout(() => {
+            if (this.pending2FA.has(tempId)) {
+              this.pending2FA.delete(tempId);
+              tfaResolve(null);
+            }
+          }, 5 * 60 * 1000);
+        });
       };
-    }
 
-    const cookies = accountData.cookies as AuthCookies;
-    
-    if (!cookies || !cookies.sid) {
-      return {
-        success: false,
-        error: 'No cached session available'
-      };
-    }
-
-    const result = await this.authService.loginWithCookies(cookies, platform);
-
-    if (result.success && result.session) {
-      this.sessions.set(accountId, result.session);
-    }
-
-    return result;
+      auth.login(credentials, twoFactorProvider).then(resolve);
+    });
   }
 
-  /**
-   * Get session for account
-   */
-  getSession(accountId: string): EASession | undefined {
-    return this.sessions.get(accountId);
+  submit2FACode(tempId: string, code: string): boolean {
+    const pending = this.pending2FA.get(tempId);
+    if (pending) {
+      pending.resolve(code);
+      this.pending2FA.delete(tempId);
+      return true;
+    }
+    return false;
   }
 
-  /**
-   * Remove session
-   */
-  removeSession(accountId: string): void {
-    this.sessions.delete(accountId);
+  hasPending2FA(tempId: string): boolean {
+    return this.pending2FA.has(tempId);
   }
 
-  /**
-   * Get auth service for advanced usage
-   */
-  getAuthService(): EAAuthService {
-    return this.authService;
+  async verifySession(
+    accountId: string,
+    sid: string,
+    platform: 'ps' | 'xbox' | 'pc'
+  ): Promise<boolean> {
+    const auth = this.getAuth(accountId);
+    return auth.verifySession(sid, platform);
+  }
+
+  clearSession(accountId: string): void {
+    const auth = this.authInstances.get(accountId);
+    if (auth) {
+      auth.clearSession();
+    }
+    this.authInstances.delete(accountId);
+    this.pending2FA.delete(accountId);
   }
 }
 
-// Export singleton
 export const eaAuthManager = new EAAuthManager();

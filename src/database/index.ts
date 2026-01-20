@@ -83,16 +83,66 @@ function encrypt(text: string): string {
 function decrypt(text: string): string {
   const key = config.security.encryptionKey;
   if (!key || key.length < 32) {
-    throw new Error('ENCRYPTION_KEY must be at least 32 characters');
+    logger.warn('ENCRYPTION_KEY not set or too short');
+    return '';
   }
   
-  const parts = text.split(':');
-  const iv = Buffer.from(parts[0], 'hex');
-  const encrypted = parts[1];
-  const decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from(key.slice(0, 32)), iv);
-  let decrypted = decipher.update(encrypted, 'hex', 'utf8');
-  decrypted += decipher.final('utf8');
-  return decrypted;
+  // Check if text is empty or null
+  if (!text || text.trim() === '') {
+    return '';
+  }
+  
+  // Try to parse as plain JSON first (old unencrypted data)
+  try {
+    const parsed = JSON.parse(text);
+    if (typeof parsed === 'object') {
+      return text; // Already valid JSON, return as-is
+    }
+  } catch {
+    // Not plain JSON, continue with decryption
+  }
+  
+  // Check if text looks like encrypted format (iv:encrypted)
+  if (!text.includes(':')) {
+    // Not encrypted format
+    return text;
+  }
+  
+  try {
+    const parts = text.split(':');
+    
+    // IV should be 32 hex characters (16 bytes)
+    if (parts.length !== 2 || parts[0].length !== 32) {
+      logger.warn('Invalid encrypted format');
+      return '';
+    }
+    
+    const ivHex = parts[0];
+    const encrypted = parts[1];
+    
+    // Validate hex characters
+    if (!/^[0-9a-fA-F]+$/.test(ivHex)) {
+      logger.warn('Invalid IV hex characters');
+      return '';
+    }
+    
+    const iv = Buffer.from(ivHex, 'hex');
+    
+    // Verify IV is valid
+    if (iv.length !== 16) {
+      logger.warn('Invalid IV length after conversion');
+      return '';
+    }
+    
+    const decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from(key.slice(0, 32)), iv);
+    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
+  } catch (e: any) {
+    // Decryption failed - cookies will need to be re-created
+    logger.warn(`Decryption failed: ${e.message}`);
+    return '';
+  }
 }
 
 // ==========================================
@@ -191,12 +241,23 @@ class Database {
     if (!account) return null;
 
     let cookies = null;
+    
+    // Try to decrypt cookies_encrypted
     if (account.cookies_encrypted) {
       try {
-        cookies = JSON.parse(decrypt(account.cookies_encrypted));
+        const decrypted = decrypt(account.cookies_encrypted);
+        if (decrypted) {
+          cookies = JSON.parse(decrypted);
+        }
       } catch (e) {
-        logger.error('Failed to decrypt cookies:', e);
+        logger.warn('Failed to decrypt/parse cookies:', e);
       }
+    }
+
+    // Fallback to session_id if cookies not available
+    if (!cookies && account.session_id) {
+      cookies = { sid: account.session_id };
+      logger.info(`Using session_id fallback for account ${accountId}`);
     }
 
     return { account, cookies };

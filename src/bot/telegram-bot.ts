@@ -1,49 +1,44 @@
 /**
- * FC26 Telegram Bot - Updated Version
- * 
- * New features:
- * - Full email/password authentication with 2FA
- * - Anti-Ban monitoring and controls
- * - Captcha handling
- * - Risk level display
+ * FC26 Telegram Bot v2.0
+ * Only email/password authentication (no SID)
  */
 
 import { Telegraf, Context, Markup } from 'telegraf';
 import { config } from '../config';
 import { db, User, EAAccount, SniperFilter } from '../database';
-import { sniperEngine, SniperSession } from '../services/sniper-engine';
-import { priceService } from '../services/price-service';
 import { EAAPI, EAAPIFactory } from '../services/ea-api';
-import { eaAuthManager, EASession, AuthCookies } from '../services/ea-auth';
+import { eaAuthManager, EACredentials } from '../services/ea-auth';
 import { antiBanService, RiskLevel } from '../services/anti-ban';
-import { captchaSolver, eaCaptchaHandler } from '../services/captcha-solver';
 import { logger } from '../utils/logger';
 
 // ==========================================
-// CONTEXT EXTENSION
+// TYPES
 // ==========================================
 
 interface BotContext extends Context {
   user?: User;
 }
 
+interface UserState {
+  step: string;
+  data: any;
+}
+
 // ==========================================
-// TELEGRAM BOT
+// TELEGRAM BOT CLASS
 // ==========================================
 
 export class TelegramBot {
   private bot: Telegraf<BotContext>;
-  private userStates: Map<number, { step: string; data: any }> = new Map();
-  private pending2FACodes: Map<number, (code: string) => void> = new Map();
+  private userStates: Map<number, UserState> = new Map();
+  private pending2FA: Map<number, string> = new Map(); // telegramId -> tempId
 
   constructor() {
     this.bot = new Telegraf<BotContext>(config.telegram.botToken);
     this.setupMiddleware();
     this.setupCommands();
     this.setupCallbacks();
-    this.setupSniperEvents();
-    this.setupAntiBanEvents();
-    this.setupCaptchaEvents();
+    this.setupMessageHandler();
   }
 
   // ==========================================
@@ -54,21 +49,18 @@ export class TelegramBot {
     // Auth middleware
     this.bot.use(async (ctx, next) => {
       if (!ctx.from) return;
-
+      
+      const startTime = Date.now();
+      
       try {
         ctx.user = await db.getOrCreateUser(ctx.from.id, ctx.from.username || null);
         await next();
       } catch (error) {
-        logger.error('Auth middleware error:', error);
+        logger.error('Middleware error:', error);
       }
-    });
 
-    // Logging middleware
-    this.bot.use(async (ctx, next) => {
-      const start = Date.now();
-      await next();
-      const ms = Date.now() - start;
-      logger.info(`[${ctx.from?.id}] ${ctx.updateType} - ${ms}ms`);
+      const duration = Date.now() - startTime;
+      logger.info(`[${ctx.from.id}] ${ctx.updateType} - ${duration}ms`);
     });
   }
 
@@ -77,132 +69,17 @@ export class TelegramBot {
   // ==========================================
 
   private setupCommands(): void {
-    // /start
-    this.bot.command('start', async (ctx) => {
-      await ctx.reply(
-        `🎮 *FC26 Ultimate Sniper Bot v2.0*\n\n` +
-        `Привіт, ${ctx.from?.first_name}! 👋\n\n` +
-        `Цей бот допоможе тобі автоматично торгувати на ринку FC 26.\n\n` +
-        `🆕 *Що нового:*\n` +
-        `• Повна авторизація через email/password\n` +
-        `• Автоматичний Anti-Ban захист\n` +
-        `• Моніторинг ризику в реальному часі\n` +
-        `• Підтримка капчі\n\n` +
-        `📋 *Основні команди:*\n` +
-        `/accounts - Керування EA акаунтами\n` +
-        `/filters - Керування фільтрами\n` +
-        `/start_sniper - Запустити снайпер\n` +
-        `/stop_sniper - Зупинити снайпер\n` +
-        `/status - Статус бота та Anti-Ban\n` +
-        `/risk - Поточний рівень ризику\n` +
-        `/settings - Налаштування Anti-Ban\n` +
-        `/help - Допомога\n\n` +
-        `🚀 Почнемо з додавання EA акаунту!`,
-        { parse_mode: 'Markdown', ...this.getMainKeyboard() }
-      );
-    });
-
-    // /accounts
-    this.bot.command('accounts', async (ctx) => {
-      await this.showAccounts(ctx);
-    });
-
-    // /add_account - NEW with full auth
-    this.bot.command('add_account', async (ctx) => {
-      await this.startAddAccount(ctx);
-    });
-
-    // /login - Login with email/password
-    this.bot.command('login', async (ctx) => {
-      await this.startFullLogin(ctx);
-    });
-
-    // /filters
-    this.bot.command('filters', async (ctx) => {
-      await this.showFilters(ctx);
-    });
-
-    // /start_sniper
-    this.bot.command('start_sniper', async (ctx) => {
-      await this.startSniper(ctx);
-    });
-
-    // /stop_sniper
-    this.bot.command('stop_sniper', async (ctx) => {
-      await this.stopSniper(ctx);
-    });
-
-    // /status - Updated with Anti-Ban info
-    this.bot.command('status', async (ctx) => {
-      await this.showStatus(ctx);
-    });
-
-    // /risk - NEW: Show risk levels
-    this.bot.command('risk', async (ctx) => {
-      await this.showRiskLevels(ctx);
-    });
-
-    // /settings - NEW: Anti-Ban settings
-    this.bot.command('settings', async (ctx) => {
-      await this.showSettings(ctx);
-    });
-
-    // /stats
-    this.bot.command('stats', async (ctx) => {
-      await this.showStats(ctx);
-    });
-
-    // /prices
-    this.bot.command('prices', async (ctx) => {
-      const args = ctx.message.text.split(' ').slice(1).join(' ');
-      if (!args) {
-        await ctx.reply('❓ Введіть імʼя гравця: `/prices Mbappe`', { parse_mode: 'Markdown' });
-        return;
-      }
-      await this.searchPrices(ctx, args);
-    });
-
-    // /help
-    this.bot.command('help', async (ctx) => {
-      await this.showHelp(ctx);
-    });
-
-    // /2fa - Submit 2FA code
-    this.bot.command('2fa', async (ctx) => {
-      const code = ctx.message.text.split(' ')[1];
-      if (!code) {
-        await ctx.reply('❓ Введіть 2FA код: `/2fa 123456`', { parse_mode: 'Markdown' });
-        return;
-      }
-      await this.handle2FACode(ctx, code);
-    });
-
-    // /captcha - Submit captcha solution
-    this.bot.command('captcha', async (ctx) => {
-      const solution = ctx.message.text.split(' ').slice(1).join(' ');
-      if (!solution) {
-        await ctx.reply('❓ Введіть рішення капчі: `/captcha solution`', { parse_mode: 'Markdown' });
-        return;
-      }
-      const success = captchaSolver.submitManualSolution(solution);
-      await ctx.reply(success ? '✅ Капча відправлена!' : '❌ Немає активної капчі');
-    });
-
-    // Keyboard button handlers
-    this.bot.hears('📱 Акаунти', async (ctx) => await this.showAccounts(ctx));
-    this.bot.hears('🎯 Фільтри', async (ctx) => await this.showFilters(ctx));
-    this.bot.hears('▶️ Старт', async (ctx) => await this.startSniper(ctx));
-    this.bot.hears('⏹ Стоп', async (ctx) => await this.stopSniper(ctx));
-    this.bot.hears('📊 Статус', async (ctx) => await this.showStatus(ctx));
-    this.bot.hears('⚠️ Ризик', async (ctx) => await this.showRiskLevels(ctx));
-
-    // Handle text messages for states
-    this.bot.on('text', async (ctx) => {
-      const state = this.userStates.get(ctx.from.id);
-      if (state) {
-        await this.handleState(ctx, state);
-      }
-    });
+    this.bot.command('start', (ctx) => this.showWelcome(ctx));
+    this.bot.command('help', (ctx) => this.showHelp(ctx));
+    this.bot.command('accounts', (ctx) => this.showAccounts(ctx));
+    this.bot.command('add_account', (ctx) => this.startAddAccount(ctx));
+    this.bot.command('filters', (ctx) => this.showFilters(ctx));
+    this.bot.command('add_filter', (ctx) => this.startAddFilter(ctx));
+    this.bot.command('status', (ctx) => this.showStatus(ctx));
+    this.bot.command('risk', (ctx) => this.showRisk(ctx));
+    this.bot.command('settings', (ctx) => this.showSettings(ctx));
+    this.bot.command('2fa', (ctx) => this.handle2FACommand(ctx));
+    this.bot.command('cancel', (ctx) => this.cancelAction(ctx));
   }
 
   // ==========================================
@@ -210,359 +87,98 @@ export class TelegramBot {
   // ==========================================
 
   private setupCallbacks(): void {
-    // Account selection
-    this.bot.action(/^account_(.+)$/, async (ctx) => {
-      await ctx.answerCbQuery();
-      const accountId = ctx.match[1];
-      await this.showAccountDetails(ctx, accountId);
-    });
-
-    // Delete account
-    this.bot.action(/^delete_account_(.+)$/, async (ctx) => {
-      await ctx.answerCbQuery('✅ Акаунт видалено');
-      const accountId = ctx.match[1];
-      await db.deleteEAAccount(accountId);
-      await this.showAccounts(ctx);
-    });
-
-    // Refresh session (new login)
-    this.bot.action(/^refresh_session_(.+)$/, async (ctx) => {
-      await ctx.answerCbQuery();
-      const accountId = ctx.match[1];
-      await this.startRefreshSession(ctx, accountId);
-    });
-
-    // Update cookies (legacy)
-    this.bot.action(/^update_cookies_(.+)$/, async (ctx) => {
-      await ctx.answerCbQuery();
-      const accountId = ctx.match[1];
-      this.userStates.set(ctx.from!.id, {
-        step: 'update_cookies',
-        data: { accountId }
-      });
-      await ctx.reply('🍪 Надішліть X-UT-SID:');
-    });
-
-    // Start/Stop sniper for account
-    this.bot.action(/^start_sniper_(.+)$/, async (ctx) => {
-      await ctx.answerCbQuery('🚀 Запуск...');
-      const accountId = ctx.match[1];
-      await this.startSniperForAccount(ctx, accountId);
-    });
-
-    this.bot.action(/^stop_sniper_(.+)$/, async (ctx) => {
-      await ctx.answerCbQuery('⏹ Зупинка...');
-      const accountId = ctx.match[1];
-      await sniperEngine.stopSession(accountId);
-      await this.showStatus(ctx);
-    });
-
-    // Filter callbacks
-    this.bot.action(/^filter_(.+)$/, async (ctx) => {
-      await ctx.answerCbQuery();
-      const filterId = ctx.match[1];
-      await this.showFilterDetails(ctx, filterId);
-    });
-
-    this.bot.action(/^toggle_filter_(.+)_(.+)$/, async (ctx) => {
-      const filterId = ctx.match[1];
-      const newState = ctx.match[2] === 'on';
-      await db.toggleFilter(filterId, newState);
-      await ctx.answerCbQuery(newState ? '✅ Увімкнено' : '⏸ Вимкнено');
-      await this.showFilters(ctx);
-    });
-
-    this.bot.action(/^delete_filter_(.+)$/, async (ctx) => {
-      await ctx.answerCbQuery('✅ Видалено');
-      const filterId = ctx.match[1];
-      await db.deleteFilter(filterId);
-      await this.showFilters(ctx);
-    });
-
     // Platform selection
-    this.bot.action(/^platform_(.+)$/, async (ctx) => {
-      await ctx.answerCbQuery();
-      const platform = ctx.match[1] as 'ps' | 'xbox' | 'pc';
-      const state = this.userStates.get(ctx.from!.id);
-      
-      if (state?.step === 'add_account_platform') {
-        state.data.platform = platform;
-        state.step = 'add_account_auth_method';
-
-        await ctx.reply(
-          '🔐 *Виберіть метод авторизації:*\n\n' +
-          '1️⃣ *Повна авторизація* - email + пароль + 2FA\n' +
-          '   ✅ Найбезпечніший варіант\n' +
-          '   ✅ Автоматичне оновлення сесії\n\n' +
-          '2️⃣ *Через SID* - тільки X-UT-SID\n' +
-          '   ⚠️ Потребує ручного оновлення\n' +
-          '   ⚠️ Сесія діє ~1 годину',
-          {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([
-              [Markup.button.callback('🔐 Повна авторизація', 'auth_method_full')],
-              [Markup.button.callback('🔑 Через SID', 'auth_method_sid')]
-            ])
-          }
-        );
-      }
-    });
-
-    // Auth method selection
-    this.bot.action('auth_method_full', async (ctx) => {
-      await ctx.answerCbQuery();
-      const state = this.userStates.get(ctx.from!.id);
-      if (state) {
-        state.step = 'full_auth_email';
-        await ctx.reply('📧 Введіть email вашого EA акаунту:');
-      }
-    });
-
-    this.bot.action('auth_method_sid', async (ctx) => {
-      await ctx.answerCbQuery();
-      const state = this.userStates.get(ctx.from!.id);
-      if (state) {
-        state.step = 'add_account_cookies';
-        await this.sendSIDInstructions(ctx);
-      }
-    });
-
-    // Add account/filter buttons
-    this.bot.action('add_account', async (ctx) => {
-      await ctx.answerCbQuery();
-      await this.startAddAccount(ctx);
-    });
-
-    this.bot.action('add_filter', async (ctx) => {
-      await ctx.answerCbQuery();
-      await this.startAddFilter(ctx);
-    });
-
-    // Account selection for filter
-    this.bot.action(/^select_account_for_filter_(.+)$/, async (ctx) => {
-      await ctx.answerCbQuery();
-      const accountId = ctx.match[1];
-      const state = this.userStates.get(ctx.from!.id);
-      if (state) {
-        state.data.accountId = accountId;
-        state.step = 'add_filter_name';
-        await ctx.reply('📝 Введіть назву фільтра:');
-      }
-    });
-
+    this.bot.action(/^platform_(.+)$/, (ctx) => this.handlePlatformSelect(ctx));
+    
+    // Account actions
+    this.bot.action(/^account_(.+)$/, (ctx) => this.handleAccountAction(ctx));
+    this.bot.action(/^refresh_(.+)$/, (ctx) => this.handleRefreshSession(ctx));
+    this.bot.action(/^delete_acc_(.+)$/, (ctx) => this.handleDeleteAccount(ctx));
+    
+    // Filter actions
+    this.bot.action(/^filter_(.+)$/, (ctx) => this.handleFilterAction(ctx));
+    this.bot.action(/^toggle_filter_(.+)$/, (ctx) => this.handleToggleFilter(ctx));
+    this.bot.action(/^delete_filter_(.+)$/, (ctx) => this.handleDeleteFilter(ctx));
+    
     // Navigation
-    this.bot.action('accounts', async (ctx) => {
-      await ctx.answerCbQuery();
-      await this.showAccounts(ctx);
-    });
-
-    this.bot.action('filters', async (ctx) => {
-      await ctx.answerCbQuery();
-      await this.showFilters(ctx);
-    });
-
-    this.bot.action('status', async (ctx) => {
-      await ctx.answerCbQuery();
-      await this.showStatus(ctx);
-    });
-
-    // Anti-Ban settings
-    this.bot.action('settings_antiban', async (ctx) => {
-      await ctx.answerCbQuery();
-      await this.showAntiBanSettings(ctx);
-    });
-
-    this.bot.action('toggle_night_mode', async (ctx) => {
-      await ctx.answerCbQuery();
-      // Toggle night mode
-      const currentConfig = antiBanService.getConfig();
-      antiBanService.updateConfig({
-        nightModeEnabled: !currentConfig.nightModeEnabled
-      });
-      await this.showAntiBanSettings(ctx);
-    });
+    this.bot.action('back_to_accounts', (ctx) => this.showAccounts(ctx));
+    this.bot.action('back_to_filters', (ctx) => this.showFilters(ctx));
+    this.bot.action('add_account', (ctx) => this.startAddAccount(ctx));
+    this.bot.action('add_filter', (ctx) => this.startAddFilter(ctx));
   }
 
   // ==========================================
-  // SNIPER EVENTS
+  // MESSAGE HANDLER
   // ==========================================
 
-  private setupSniperEvents(): void {
-    sniperEngine.on('item_purchased', async (data) => {
-      const { accountId, item, buyPrice, sellPrice } = data;
-      
-      const accounts = await this.getAccountsByAccountId(accountId);
-      if (!accounts.length) return;
+  private setupMessageHandler(): void {
+    this.bot.on('text', async (ctx) => {
+      const state = this.userStates.get(ctx.from.id);
+      if (!state) return;
 
-      const user = await db.getUserByTelegramId(accounts[0].user_id as any);
-      if (!user) return;
+      const text = ctx.message.text.trim();
 
-      const riskPercent = antiBanService.getRiskPercentage(accountId);
-      const riskEmoji = riskPercent < 30 ? '🟢' : riskPercent < 60 ? '🟡' : '🔴';
-
-      await this.bot.telegram.sendMessage(
-        user.telegram_id,
-        `✅ *Куплено!*\n\n` +
-        `👤 ${EAAPI.getPlayerName(item)}\n` +
-        `💰 Ціна: ${buyPrice.toLocaleString()} монет\n` +
-        `🏷️ Продаж: ${sellPrice?.toLocaleString() || 'Auto'} монет\n\n` +
-        `${riskEmoji} Ризик: ${riskPercent.toFixed(1)}%`,
-        { parse_mode: 'Markdown' }
-      );
-    });
-
-    sniperEngine.on('item_sold', async (data) => {
-      const { accountId, item, sellPrice } = data;
-      
-      const accounts = await this.getAccountsByAccountId(accountId);
-      if (!accounts.length) return;
-
-      const user = await db.getUserByTelegramId(accounts[0].user_id as any);
-      if (!user) return;
-
-      await this.bot.telegram.sendMessage(
-        user.telegram_id,
-        `💰 *Продано!*\n\n` +
-        `👤 ${EAAPI.getPlayerName(item)}\n` +
-        `💵 Ціна: ${sellPrice.toLocaleString()} монет`,
-        { parse_mode: 'Markdown' }
-      );
-    });
-
-    sniperEngine.on('session_expired', async (data) => {
-      const { accountId } = data;
-      
-      const accounts = await this.getAccountsByAccountId(accountId);
-      if (!accounts.length) return;
-
-      const user = await db.getUserByTelegramId(accounts[0].user_id as any);
-      if (!user) return;
-
-      await this.bot.telegram.sendMessage(
-        user.telegram_id,
-        `⚠️ *Сесія закінчилась!*\n\n` +
-        `Потрібно оновити авторизацію.\n` +
-        `Використайте /accounts → Оновити сесію`,
-        { parse_mode: 'Markdown' }
-      );
-    });
-  }
-
-  // ==========================================
-  // ANTI-BAN EVENTS
-  // ==========================================
-
-  private setupAntiBanEvents(): void {
-    antiBanService.on('stats_updated', async (stats) => {
-      // Check if approaching limits
-      const riskPercent = antiBanService.getRiskPercentage(stats.accountId);
-      
-      if (riskPercent >= 80 && stats.currentRiskLevel !== RiskLevel.HIGH) {
-        const accounts = await this.getAccountsByAccountId(stats.accountId);
-        if (!accounts.length) return;
-
-        const user = await db.getUserByTelegramId(accounts[0].user_id as any);
-        if (!user) return;
-
-        await this.bot.telegram.sendMessage(
-          user.telegram_id,
-          `🔴 *УВАГА: Високий ризик бану!*\n\n` +
-          `Ризик: ${riskPercent.toFixed(1)}%\n` +
-          `Рекомендуємо зупинити снайпер!`,
-          { parse_mode: 'Markdown' }
-        );
-      }
-    });
-
-    antiBanService.on('critical_error', async ({ accountId, errorCode }) => {
-      const accounts = await this.getAccountsByAccountId(accountId);
-      if (!accounts.length) return;
-
-      const user = await db.getUserByTelegramId(accounts[0].user_id as any);
-      if (!user) return;
-
-      await this.bot.telegram.sendMessage(
-        user.telegram_id,
-        `🚨 *КРИТИЧНА ПОМИЛКА!*\n\n` +
-        `Код: ${errorCode}\n` +
-        `Снайпер автоматично зупинено.\n\n` +
-        `Можливі причини:\n` +
-        `• 429 - Занадто багато запитів\n` +
-        `• 458 - Трансферний ринок заблоковано\n` +
-        `• 512 - Ринок тимчасово недоступний`,
-        { parse_mode: 'Markdown' }
-      );
-    });
-
-    antiBanService.on('global_pause', async ({ durationMs }) => {
-      // Notify all active users about pause
-      const sessions = sniperEngine.getAllSessions();
-      for (const session of sessions) {
-        const accounts = await this.getAccountsByAccountId(session.accountId);
-        if (!accounts.length) continue;
-
-        const user = await db.getUserByTelegramId(accounts[0].user_id as any);
-        if (!user) continue;
-
-        await this.bot.telegram.sendMessage(
-          user.telegram_id,
-          `⏸ *Автоматична пауза*\n\n` +
-          `Тривалість: ${Math.floor(durationMs / 60000)} хв\n` +
-          `Причина: Досягнуто лімітів Anti-Ban`,
-          { parse_mode: 'Markdown' }
-        );
+      switch (state.step) {
+        case 'email':
+          await this.handleEmailInput(ctx, text);
+          break;
+        case 'password':
+          await this.handlePasswordInput(ctx, text);
+          break;
+        case 'filter_name':
+          await this.handleFilterName(ctx, text);
+          break;
+        case 'filter_max_buy':
+          await this.handleFilterMaxBuy(ctx, text);
+          break;
+        case 'filter_sell_price':
+          await this.handleFilterSellPrice(ctx, text);
+          break;
       }
     });
   }
 
   // ==========================================
-  // CAPTCHA EVENTS
+  // WELCOME & HELP
   // ==========================================
 
-  private setupCaptchaEvents(): void {
-    captchaSolver.on('manual_captcha_required', async ({ type, websiteURL }) => {
-      // Notify all active users
-      const sessions = sniperEngine.getAllSessions();
-      for (const session of sessions) {
-        const accounts = await this.getAccountsByAccountId(session.accountId);
-        if (!accounts.length) continue;
+  private async showWelcome(ctx: BotContext): Promise<void> {
+    await ctx.reply(
+      `👋 *Вітаю у FC26 Sniper Bot v2.0!*\n\n` +
+      `🔐 *Авторизація:* Email + Password + 2FA\n` +
+      `🛡️ *Anti-Ban:* Захист від блокування\n` +
+      `⚡ *Швидкість:* 7-15 сек між запитами\n\n` +
+      `*Почати роботу:*\n` +
+      `1️⃣ /add_account - додати EA акаунт\n` +
+      `2️⃣ /add_filter - створити фільтр\n` +
+      `3️⃣ Запустити снайпер\n\n` +
+      `📖 /help - всі команди`,
+      { parse_mode: 'Markdown' }
+    );
+  }
 
-        const user = await db.getUserByTelegramId(accounts[0].user_id as any);
-        if (!user) continue;
-
-        await this.bot.telegram.sendMessage(
-          user.telegram_id,
-          `🔐 *Потрібна капча!*\n\n` +
-          `Тип: ${type}\n` +
-          `URL: ${websiteURL}\n\n` +
-          `Відкрийте Web App та пройдіть перевірку,\n` +
-          `або введіть рішення: /captcha <solution>`,
-          { parse_mode: 'Markdown' }
-        );
-      }
-    });
-
-    captchaSolver.on('captcha_solved', async () => {
-      // Notify users
-      const sessions = sniperEngine.getAllSessions();
-      for (const session of sessions) {
-        const accounts = await this.getAccountsByAccountId(session.accountId);
-        if (!accounts.length) continue;
-
-        const user = await db.getUserByTelegramId(accounts[0].user_id as any);
-        if (!user) continue;
-
-        await this.bot.telegram.sendMessage(
-          user.telegram_id,
-          `✅ Капча розв'язана! Снайпер продовжує роботу.`,
-          { parse_mode: 'Markdown' }
-        );
-      }
-    });
+  private async showHelp(ctx: BotContext): Promise<void> {
+    await ctx.reply(
+      `📖 *Команди бота:*\n\n` +
+      `👤 *Акаунти:*\n` +
+      `/accounts - список акаунтів\n` +
+      `/add_account - додати акаунт\n\n` +
+      `🎯 *Фільтри:*\n` +
+      `/filters - список фільтрів\n` +
+      `/add_filter - додати фільтр\n\n` +
+      `📊 *Статус:*\n` +
+      `/status - статус бота\n` +
+      `/risk - рівні ризику\n` +
+      `/settings - налаштування Anti-Ban\n\n` +
+      `🔐 *Авторизація:*\n` +
+      `/2fa <код> - ввести 2FA код\n\n` +
+      `❌ /cancel - скасувати дію`,
+      { parse_mode: 'Markdown' }
+    );
   }
 
   // ==========================================
-  // HANDLERS
+  // ACCOUNTS
   // ==========================================
 
   private async showAccounts(ctx: BotContext): Promise<void> {
@@ -571,212 +187,550 @@ export class TelegramBot {
     const accounts = await db.getEAAccountsByUser(ctx.user.id);
 
     if (accounts.length === 0) {
+      const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('➕ Додати акаунт', 'add_account')]
+      ]);
+
       await ctx.reply(
-        '📭 У вас немає EA акаунтів.\n\nДодайте перший акаунт:',
-        Markup.inlineKeyboard([
-          [Markup.button.callback('➕ Додати акаунт', 'add_account')]
-        ])
+        '📭 У вас немає акаунтів.\n\nДодайте перший акаунт для початку роботи.',
+        keyboard
       );
       return;
     }
 
-    const buttons = accounts.map(acc => {
-      const session = sniperEngine.getSession(acc.id);
-      const statusIcon = session?.status === 'running' ? '🟢' : '⚪';
-      return [
-        Markup.button.callback(
-          `${statusIcon} ${acc.platform.toUpperCase()} | ${acc.email} | ${acc.coins.toLocaleString()}💰`,
-          `account_${acc.id}`
-        )
-      ];
-    });
+    let text = '👤 *Ваші акаунти:*\n\n';
+    const buttons: any[] = [];
+
+    for (const acc of accounts) {
+      const riskInfo = antiBanService.getStats(acc.id);
+      const riskEmoji = this.getRiskEmoji(riskInfo?.riskLevel || RiskLevel.LOW);
+      
+      text += `${riskEmoji} *${acc.email}*\n`;
+      text += `├ Платформа: ${acc.platform.toUpperCase()}\n`;
+      text += `├ Монети: ${acc.coins.toLocaleString()}\n`;
+      text += `└ Сесія: ${acc.session_id ? '✅' : '❌'}\n\n`;
+
+      buttons.push([Markup.button.callback(`📧 ${acc.email}`, `account_${acc.id}`)]);
+    }
 
     buttons.push([Markup.button.callback('➕ Додати акаунт', 'add_account')]);
 
-    await ctx.reply(
-      `📱 *Ваші EA акаунти:*`,
-      { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
-    );
+    if ('editMessageText' in ctx) {
+      await (ctx as any).editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+    } else {
+      await ctx.reply(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+    }
   }
 
-  private async showAccountDetails(ctx: BotContext, accountId: string): Promise<void> {
-    const accountData = await db.getEAAccountWithCookies(accountId);
-    if (!accountData) {
-      await ctx.reply('❌ Акаунт не знайдено');
+  private async handleAccountAction(ctx: any): Promise<void> {
+    const accountId = ctx.match[1];
+    const account = await db.getEAAccountById(accountId);
+    
+    if (!account) {
+      await ctx.answerCbQuery('Акаунт не знайдено');
       return;
     }
 
-    const { account } = accountData;
-    const session = sniperEngine.getSession(accountId);
-    const riskPercent = antiBanService.getRiskPercentage(accountId);
+    const riskInfo = antiBanService.getStats(accountId);
+    const riskEmoji = this.getRiskEmoji(riskInfo?.riskLevel || RiskLevel.LOW);
 
-    let statusText = '⏹ Зупинено';
-    if (session) {
-      switch (session.status) {
-        case 'running': statusText = '🟢 Працює'; break;
-        case 'paused': statusText = '⏸ Пауза'; break;
-        case 'error': statusText = '🔴 Помилка'; break;
-      }
-    }
-
-    const riskEmoji = riskPercent < 30 ? '🟢' : riskPercent < 60 ? '🟡' : '🔴';
-
-    await ctx.editMessageText(
-      `📱 *Акаунт: ${account.email}*\n\n` +
+    const text = `👤 *${account.email}*\n\n` +
       `🎮 Платформа: ${account.platform.toUpperCase()}\n` +
       `💰 Монети: ${account.coins.toLocaleString()}\n` +
-      `📊 Статус: ${statusText}\n` +
-      `${riskEmoji} Ризик: ${riskPercent.toFixed(1)}%\n` +
-      `🕐 Останній вхід: ${account.last_login ? new Date(account.last_login).toLocaleString('uk-UA') : 'Ніколи'}`,
-      {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-          [
-            session?.status === 'running'
-              ? Markup.button.callback('⏹ Зупинити', `stop_sniper_${accountId}`)
-              : Markup.button.callback('▶️ Запустити', `start_sniper_${accountId}`)
-          ],
-          [Markup.button.callback('🔄 Оновити сесію', `refresh_session_${accountId}`)],
-          [Markup.button.callback('🔑 Оновити SID', `update_cookies_${accountId}`)],
-          [Markup.button.callback('🗑 Видалити', `delete_account_${accountId}`)],
-          [Markup.button.callback('« Назад', 'accounts')]
-        ])
-      }
-    );
+      `🔑 Сесія: ${account.session_id ? '✅ Активна' : '❌ Немає'}\n` +
+      `${riskEmoji} Ризик: ${riskInfo?.riskLevel || 'Невідомо'}\n`;
+
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback('🔄 Оновити сесію', `refresh_${accountId}`)],
+      [Markup.button.callback('🗑 Видалити', `delete_acc_${accountId}`)],
+      [Markup.button.callback('« Назад', 'back_to_accounts')]
+    ]);
+
+    await ctx.editMessageText(text, { parse_mode: 'Markdown', ...keyboard });
   }
+
+  // ==========================================
+  // ADD ACCOUNT FLOW
+  // ==========================================
 
   private async startAddAccount(ctx: BotContext): Promise<void> {
     this.userStates.set(ctx.from!.id, {
-      step: 'add_account_email',
+      step: 'email',
       data: {}
     });
 
-    await ctx.reply('📧 Введіть email EA акаунту:');
+    await ctx.reply(
+      '📧 *Додавання акаунта*\n\n' +
+      'Введіть email вашого EA акаунта:',
+      { parse_mode: 'Markdown' }
+    );
   }
 
-  private async startRefreshSession(ctx: BotContext, accountId: string): Promise<void> {
-    const accountData = await db.getEAAccountWithCookies(accountId);
-    if (!accountData) {
-      await ctx.reply('❌ Акаунт не знайдено');
+  private async handleEmailInput(ctx: BotContext, email: string): Promise<void> {
+    if (!email.includes('@')) {
+      await ctx.reply('❌ Невірний формат email. Спробуйте ще раз:');
+      return;
+    }
+
+    const state = this.userStates.get(ctx.from!.id)!;
+    state.data.email = email;
+    state.step = 'platform';
+
+    const keyboard = Markup.inlineKeyboard([
+      [
+        Markup.button.callback('🎮 PlayStation', 'platform_ps'),
+        Markup.button.callback('🎮 Xbox', 'platform_xbox')
+      ],
+      [Markup.button.callback('💻 PC', 'platform_pc')]
+    ]);
+
+    await ctx.reply('🎮 Виберіть платформу:', keyboard);
+  }
+
+  private async handlePlatformSelect(ctx: any): Promise<void> {
+    const platform = ctx.match[1] as 'ps' | 'xbox' | 'pc';
+    const state = this.userStates.get(ctx.from!.id);
+
+    if (!state || state.step !== 'platform') {
+      await ctx.answerCbQuery('Сесія застаріла. Почніть заново /add_account');
+      return;
+    }
+
+    state.data.platform = platform;
+    state.step = 'password';
+
+    await ctx.answerCbQuery();
+    await ctx.reply(
+      '🔐 Введіть пароль від EA акаунта:\n\n' +
+      '⚠️ Пароль використовується тільки для авторизації і НЕ зберігається.',
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  private async handlePasswordInput(ctx: BotContext, password: string): Promise<void> {
+    const state = this.userStates.get(ctx.from!.id);
+    if (!state || state.step !== 'password') return;
+
+    // Delete password message for security
+    try {
+      await ctx.deleteMessage();
+    } catch {}
+
+    const { email, platform } = state.data;
+    const tempId = `temp_${ctx.from!.id}_${Date.now()}`;
+
+    await ctx.reply('⏳ Авторизація в EA...');
+
+    const credentials: EACredentials = { email, password, platform };
+    
+    try {
+      const result = await eaAuthManager.loginWithCredentials(tempId, credentials);
+
+      if (result.requires2FA) {
+        this.pending2FA.set(ctx.from!.id, tempId);
+        state.step = '2fa';
+        
+        await ctx.reply(
+          '🔐 *Потрібен 2FA код*\n\n' +
+          'EA надіслав код на вашу пошту/телефон.\n\n' +
+          'Введіть команду:\n' +
+          '`/2fa XXXXXX`\n\n' +
+          '(де XXXXXX - ваш код)',
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      if (!result.success) {
+        this.userStates.delete(ctx.from!.id);
+        await ctx.reply(`❌ Помилка: ${result.error}`);
+        return;
+      }
+
+      // Success - save account
+      await this.saveAccount(ctx, result);
+
+    } catch (error: any) {
+      logger.error('Login error:', error);
+      this.userStates.delete(ctx.from!.id);
+      await ctx.reply(`❌ Помилка авторизації: ${error.message}`);
+    }
+  }
+
+  private async handle2FACommand(ctx: BotContext): Promise<void> {
+    const text = ctx.message?.text || '';
+    const code = text.replace('/2fa', '').trim();
+
+    if (!code) {
+      await ctx.reply('❌ Введіть код: `/2fa 123456`', { parse_mode: 'Markdown' });
+      return;
+    }
+
+    const tempId = this.pending2FA.get(ctx.from!.id);
+    if (!tempId) {
+      await ctx.reply('❌ Немає активного запиту на 2FA. Почніть заново /add_account');
+      return;
+    }
+
+    await ctx.reply('⏳ Перевірка коду...');
+
+    const submitted = eaAuthManager.submit2FACode(tempId, code);
+    if (!submitted) {
+      await ctx.reply('❌ Не вдалося відправити код. Спробуйте заново /add_account');
+      this.pending2FA.delete(ctx.from!.id);
+      this.userStates.delete(ctx.from!.id);
+      return;
+    }
+
+    // Wait for result (login will continue in background)
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    
+    // Check if account was created
+    const state = this.userStates.get(ctx.from!.id);
+    if (state?.step === 'completed') {
+      // Success was handled by saveAccount
+      return;
+    }
+
+    // If still waiting, inform user
+    await ctx.reply(
+      '⏳ Авторизація продовжується...\n\n' +
+      'Якщо через 30 секунд не буде відповіді - спробуйте заново.'
+    );
+  }
+
+  private async saveAccount(ctx: BotContext, result: any): Promise<void> {
+    const state = this.userStates.get(ctx.from!.id);
+    if (!state) return;
+
+    const { email, platform } = state.data;
+    const cookies = result.cookies || { sid: result.session?.sid, platform };
+
+    try {
+      const account = await db.addEAAccount(
+        ctx.user!.id,
+        email,
+        platform,
+        cookies
+      );
+
+      if (!account) {
+        await ctx.reply('❌ Помилка збереження акаунту');
+        return;
+      }
+
+      // Update coins
+      if (result.session?.sid) {
+        const auth = eaAuthManager.getAuth(account.id);
+        const credits = await auth.getCredits(result.session.sid, platform);
+        await db.updateEAAccountSession(account.id, { 
+          session_id: result.session.sid,
+          coins: credits 
+        });
+      }
+
+      state.step = 'completed';
+      this.userStates.delete(ctx.from!.id);
+      this.pending2FA.delete(ctx.from!.id);
+
+      await ctx.reply(
+        `✅ *Акаунт додано!*\n\n` +
+        `📧 Email: ${email}\n` +
+        `🎮 Платформа: ${platform.toUpperCase()}\n` +
+        `🔑 Сесія: ✅\n\n` +
+        `Наступний крок: /add_filter`,
+        { parse_mode: 'Markdown' }
+      );
+
+    } catch (error: any) {
+      logger.error('Save account error:', error);
+      await ctx.reply(`❌ Помилка: ${error.message}`);
+    }
+  }
+
+  // ==========================================
+  // REFRESH SESSION
+  // ==========================================
+
+  private async handleRefreshSession(ctx: any): Promise<void> {
+    const accountId = ctx.match[1];
+    
+    await ctx.answerCbQuery();
+    await ctx.reply(
+      '🔄 *Оновлення сесії*\n\n' +
+      'Для оновлення потрібно повторно авторизуватися.\n' +
+      'Використайте /add_account з тим же email.',
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  // ==========================================
+  // DELETE ACCOUNT
+  // ==========================================
+
+  private async handleDeleteAccount(ctx: any): Promise<void> {
+    const accountId = ctx.match[1];
+    
+    await db.deleteEAAccount(accountId);
+    await ctx.answerCbQuery('✅ Акаунт видалено');
+    await this.showAccounts(ctx);
+  }
+
+  // ==========================================
+  // FILTERS
+  // ==========================================
+
+  private async showFilters(ctx: BotContext): Promise<void> {
+    if (!ctx.user) return;
+
+    const filters = await db.getFiltersByUser(ctx.user.id);
+
+    if (filters.length === 0) {
+      const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('➕ Додати фільтр', 'add_filter')]
+      ]);
+
+      await ctx.reply(
+        '📭 У вас немає фільтрів.\n\nСтворіть перший фільтр для снайпінгу.',
+        keyboard
+      );
+      return;
+    }
+
+    let text = '🎯 *Ваші фільтри:*\n\n';
+    const buttons: any[] = [];
+
+    for (const filter of filters) {
+      const status = filter.is_active ? '🟢' : '⚪';
+      text += `${status} *${filter.name}*\n`;
+      text += `├ Max: ${filter.max_buy.toLocaleString()}\n`;
+      text += `└ Sell: ${filter.sell_price?.toLocaleString() || 'Не вказано'}\n\n`;
+
+      buttons.push([Markup.button.callback(`🎯 ${filter.name}`, `filter_${filter.id}`)]);
+    }
+
+    buttons.push([Markup.button.callback('➕ Додати фільтр', 'add_filter')]);
+
+    if ('editMessageText' in ctx) {
+      await (ctx as any).editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+    } else {
+      await ctx.reply(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+    }
+  }
+
+  private async handleFilterAction(ctx: any): Promise<void> {
+    const filterId = ctx.match[1];
+    const filter = await db.getFilterById(filterId);
+    
+    if (!filter) {
+      await ctx.answerCbQuery('Фільтр не знайдено');
+      return;
+    }
+
+    const status = filter.is_active ? '🟢 Активний' : '⚪ Неактивний';
+
+    const text = `🎯 *${filter.name}*\n\n` +
+      `📊 Статус: ${status}\n` +
+      `💰 Max Buy: ${filter.max_buy.toLocaleString()}\n` +
+      `💵 Sell: ${filter.sell_price?.toLocaleString() || 'Не вказано'}\n`;
+
+    const toggleText = filter.is_active ? '⏸ Вимкнути' : '▶️ Увімкнути';
+    
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback(toggleText, `toggle_filter_${filterId}`)],
+      [Markup.button.callback('🗑 Видалити', `delete_filter_${filterId}`)],
+      [Markup.button.callback('« Назад', 'back_to_filters')]
+    ]);
+
+    await ctx.editMessageText(text, { parse_mode: 'Markdown', ...keyboard });
+  }
+
+  private async handleToggleFilter(ctx: any): Promise<void> {
+    const filterId = ctx.match[1];
+    const filter = await db.getFilterById(filterId);
+    
+    if (!filter) {
+      await ctx.answerCbQuery('Фільтр не знайдено');
+      return;
+    }
+
+    await db.toggleFilter(filterId, !filter.is_active);
+    await ctx.answerCbQuery(filter.is_active ? 'Фільтр вимкнено' : 'Фільтр увімкнено');
+    
+    // Refresh view
+    ctx.match[1] = filterId;
+    await this.handleFilterAction(ctx);
+  }
+
+  private async handleDeleteFilter(ctx: any): Promise<void> {
+    const filterId = ctx.match[1];
+    
+    await db.deleteFilter(filterId);
+    await ctx.answerCbQuery('✅ Фільтр видалено');
+    await this.showFilters(ctx);
+  }
+
+  // ==========================================
+  // ADD FILTER FLOW
+  // ==========================================
+
+  private async startAddFilter(ctx: BotContext): Promise<void> {
+    if (!ctx.user) return;
+
+    const accounts = await db.getEAAccountsByUser(ctx.user.id);
+    
+    if (accounts.length === 0) {
+      await ctx.reply('❌ Спочатку додайте акаунт: /add_account');
       return;
     }
 
     this.userStates.set(ctx.from!.id, {
-      step: 'refresh_auth_password',
-      data: { 
-        accountId,
-        email: accountData.account.email,
-        platform: accountData.account.platform
-      }
+      step: 'filter_name',
+      data: { ea_account_id: accounts[0].id }
     });
 
     await ctx.reply(
-      `🔐 *Оновлення сесії*\n\n` +
-      `Email: ${accountData.account.email}\n\n` +
-      `Введіть пароль від EA акаунту:`,
+      '🎯 *Створення фільтра*\n\n' +
+      'Введіть назву фільтра (наприклад: "Mbappe cheap"):',
       { parse_mode: 'Markdown' }
     );
   }
 
-  private async sendSIDInstructions(ctx: Context): Promise<void> {
+  private async handleFilterName(ctx: BotContext, name: string): Promise<void> {
+    const state = this.userStates.get(ctx.from!.id)!;
+    state.data.name = name;
+    state.step = 'filter_max_buy';
+
     await ctx.reply(
-      '🔑 *Як отримати X-UT-SID:*\n\n' +
-      '1. Відкрийте EA FC Web App\n' +
-      '2. Увійдіть в акаунт\n' +
-      '3. Перейдіть на ТРАНСФЕРНИЙ РИНОК\n' +
-      '4. Зробіть будь-який пошук\n' +
-      '5. Натисніть F12 (DevTools)\n' +
-      '6. Вкладка Network\n' +
-      '7. Знайдіть запит до fut.ea.com\n' +
-      '8. Скопіюйте X-UT-SID з Headers\n\n' +
-      'SID виглядає так:\n' +
-      '`f1888c19-c261-4e8c-b49e-1e202c4a872f`\n\n' +
-      '📤 Надішліть X-UT-SID:',
-      { parse_mode: 'Markdown' }
+      '💰 Введіть максимальну ціну покупки (Buy Now):\n\n' +
+      'Наприклад: 10000'
     );
   }
+
+  private async handleFilterMaxBuy(ctx: BotContext, text: string): Promise<void> {
+    const maxBuy = parseInt(text.replace(/[^0-9]/g, ''));
+    
+    if (isNaN(maxBuy) || maxBuy < 150) {
+      await ctx.reply('❌ Введіть коректну суму (мінімум 150):');
+      return;
+    }
+
+    const state = this.userStates.get(ctx.from!.id)!;
+    state.data.max_buy = maxBuy;
+    state.step = 'filter_sell_price';
+
+    await ctx.reply(
+      '💵 Введіть ціну продажу (або "skip" щоб пропустити):\n\n' +
+      'Наприклад: 15000'
+    );
+  }
+
+  private async handleFilterSellPrice(ctx: BotContext, text: string): Promise<void> {
+    const state = this.userStates.get(ctx.from!.id)!;
+    
+    if (text.toLowerCase() !== 'skip') {
+      const sellPrice = parseInt(text.replace(/[^0-9]/g, ''));
+      if (!isNaN(sellPrice) && sellPrice > 0) {
+        state.data.sell_price = sellPrice;
+      }
+    }
+
+    // Create filter
+    const filter = await db.addFilter({
+      user_id: ctx.user!.id,
+      ea_account_id: state.data.ea_account_id,
+      name: state.data.name,
+      player_id: null,
+      min_buy: null,
+      max_buy: state.data.max_buy,
+      sell_price: state.data.sell_price || null,
+      position: null,
+      quality: null,
+      rarity: null,
+      nation: null,
+      league: null,
+      club: null,
+      is_active: true
+    });
+
+    this.userStates.delete(ctx.from!.id);
+
+    if (filter) {
+      await ctx.reply(
+        `✅ *Фільтр створено!*\n\n` +
+        `📝 Назва: ${filter.name}\n` +
+        `💰 Max Buy: ${filter.max_buy.toLocaleString()}\n` +
+        `💵 Sell: ${filter.sell_price?.toLocaleString() || 'Не вказано'}\n\n` +
+        `/filters - переглянути всі фільтри`,
+        { parse_mode: 'Markdown' }
+      );
+    } else {
+      await ctx.reply('❌ Помилка створення фільтра');
+    }
+  }
+
+  // ==========================================
+  // STATUS & RISK
+  // ==========================================
 
   private async showStatus(ctx: BotContext): Promise<void> {
     if (!ctx.user) return;
 
     const accounts = await db.getEAAccountsByUser(ctx.user.id);
-    
-    let statusText = '📊 *Статус бота*\n\n';
+    const filters = await db.getFiltersByUser(ctx.user.id);
 
-    for (const acc of accounts) {
-      const session = sniperEngine.getSession(acc.id);
-      const antiBanStatus = antiBanService.getStatus(acc.id);
-      
-      statusText += `*${acc.email}*\n`;
-      
-      if (session) {
-        const statusIcon = {
-          'running': '🟢',
-          'paused': '⏸',
-          'stopped': '⏹',
-          'error': '🔴'
-        }[session.status];
+    let text = '📊 *Статус бота*\n\n';
+    text += `👤 Акаунтів: ${accounts.length}\n`;
+    text += `🎯 Фільтрів: ${filters.length}\n`;
+    text += `✅ Активних: ${filters.filter(f => f.is_active).length}\n\n`;
 
-        statusText += `├ Статус: ${statusIcon} ${session.status}\n`;
-        statusText += `├ Пошуків: ${session.stats.searches}\n`;
-        statusText += `├ Покупок: ${session.stats.purchases}\n`;
-        statusText += `├ Прибуток: ${session.stats.profit.toLocaleString()}💰\n`;
-        statusText += `└ Anti-Ban:\n${antiBanStatus.split('\n').map(l => '  ' + l).join('\n')}\n\n`;
-      } else {
-        statusText += `└ Статус: ⏹ Не запущено\n\n`;
+    if (accounts.length > 0) {
+      text += '*Акаунти:*\n';
+      for (const acc of accounts) {
+        const emoji = acc.session_id ? '🟢' : '🔴';
+        text += `${emoji} ${acc.email}\n`;
       }
     }
 
-    await ctx.reply(statusText, { parse_mode: 'Markdown' });
+    await ctx.reply(text, { parse_mode: 'Markdown' });
   }
 
-  private async showRiskLevels(ctx: BotContext): Promise<void> {
+  private async showRisk(ctx: BotContext): Promise<void> {
     if (!ctx.user) return;
 
     const accounts = await db.getEAAccountsByUser(ctx.user.id);
-    
+
+    if (accounts.length === 0) {
+      await ctx.reply('📭 Немає акаунтів для відображення ризику.');
+      return;
+    }
+
     let text = '⚠️ *Рівні ризику*\n\n';
 
     for (const acc of accounts) {
-      const riskPercent = antiBanService.getRiskPercentage(acc.id);
-      const session = antiBanService.getSession(acc.id);
-
-      const riskEmoji = riskPercent < 30 ? '🟢' : riskPercent < 60 ? '🟡' : riskPercent < 85 ? '🟠' : '🔴';
-      const riskLevel = riskPercent < 30 ? 'Низький' : riskPercent < 60 ? 'Середній' : riskPercent < 85 ? 'Високий' : 'КРИТИЧНИЙ';
+      const stats = antiBanService.getStats(acc.id);
+      const riskEmoji = this.getRiskEmoji(stats?.riskLevel || RiskLevel.LOW);
+      const riskPercent = stats?.riskPercent || 0;
 
       text += `*${acc.email}*\n`;
-      text += `├ ${riskEmoji} Ризик: ${riskPercent.toFixed(1)}% (${riskLevel})\n`;
-      
-      if (session) {
-        text += `├ Запитів: ${session.requestsThisHour}/${config.antiBan.maxRequestsPerHour}\n`;
-        text += `├ Пошуків: ${session.searchesThisHour}/${config.antiBan.maxSearchesPerHour}\n`;
-        text += `├ Покупок: ${session.purchasesThisHour}/${config.antiBan.maxPurchasesPerHour}\n`;
-        text += `└ Помилок: ${session.errorsThisHour}\n`;
-      } else {
-        text += `└ Сесія не активна\n`;
-      }
-      
-      text += '\n';
+      text += `├ ${riskEmoji} Ризик: ${riskPercent.toFixed(1)}%\n`;
+      text += `├ Запитів: ${stats?.requestsThisHour || 0}/400\n`;
+      text += `├ Пошуків: ${stats?.searchesThisHour || 0}/350\n`;
+      text += `├ Покупок: ${stats?.purchasesThisHour || 0}/25\n`;
+      text += `└ Помилок: ${stats?.errorsThisHour || 0}\n\n`;
     }
 
-    text += `*Рівні:*\n`;
-    text += `🟢 0-30% - Безпечно\n`;
-    text += `🟡 30-60% - Обережно\n`;
-    text += `🟠 60-85% - Небезпечно\n`;
-    text += `🔴 85-100% - КРИТИЧНО`;
+    text += '🟢 0-30% - Безпечно\n';
+    text += '🟡 30-60% - Обережно\n';
+    text += '🟠 60-85% - Небезпечно\n';
+    text += '🔴 85-100% - КРИТИЧНО';
 
     await ctx.reply(text, { parse_mode: 'Markdown' });
   }
 
   private async showSettings(ctx: BotContext): Promise<void> {
-    await this.showAntiBanSettings(ctx);
-  }
-
-  private async showAntiBanSettings(ctx: BotContext): Promise<void> {
-    const cfg = antiBanService.getConfig();
-
-    const nightModeStatus = cfg.nightModeEnabled ? '✅' : '❌';
-
+    const cfg = config.antiBan;
+    
     const text = `⚙️ *Налаштування Anti-Ban*\n\n` +
       `*Затримки:*\n` +
       `├ Пошук: ${cfg.searchDelay.min/1000}-${cfg.searchDelay.max/1000}с\n` +
@@ -787,591 +741,60 @@ export class TelegramBot {
       `├ Покупок/год: ${cfg.maxPurchasesPerHour}\n` +
       `├ Запитів/год: ${cfg.maxRequestsPerHour}\n` +
       `└ Запитів/день: ${cfg.maxRequestsPerDay}\n\n` +
-      `*Сесії:*\n` +
-      `├ Тривалість: ${cfg.sessionDurationMs/60000} хв\n` +
-      `├ Пауза між: ${cfg.pauseBetweenSessionsMs/60000} хв\n` +
-      `└ Пауза після ${cfg.pauseAfterSearches} пошуків\n\n` +
-      `*Нічний режим:* ${nightModeStatus}\n` +
+      `*Нічний режим:* ${cfg.nightModeEnabled ? '✅' : '❌'}\n` +
       `└ ${cfg.nightModeStart}:00 - ${cfg.nightModeEnd}:00`;
 
-    const keyboard = Markup.inlineKeyboard([
-      [Markup.button.callback(
-        cfg.nightModeEnabled ? '🌙 Вимкнути нічний режим' : '🌙 Увімкнути нічний режим',
-        'toggle_night_mode'
-      )]
-    ]);
-
-    if ('editMessageText' in ctx) {
-      await (ctx as any).editMessageText(text, { parse_mode: 'Markdown', ...keyboard });
-    } else {
-      await (ctx as BotContext).reply(text, { parse_mode: 'Markdown', ...keyboard });
-    }
-  }
-
-  private async showHelp(ctx: BotContext): Promise<void> {
-    await ctx.reply(
-      `📖 *Допомога FC26 Sniper Bot v2.0*\n\n` +
-      `*Як почати:*\n` +
-      `1️⃣ Додайте EA акаунт /add_account\n` +
-      `2️⃣ Виберіть метод авторизації\n` +
-      `3️⃣ Створіть фільтр /filters\n` +
-      `4️⃣ Запустіть снайпер /start_sniper\n\n` +
-      `*Методи авторизації:*\n` +
-      `🔐 *Повна* - email + пароль + 2FA код\n` +
-      `   Автоматично оновлює сесію\n` +
-      `🔑 *SID* - тільки X-UT-SID токен\n` +
-      `   Потребує ручного оновлення\n\n` +
-      `*Anti-Ban система:*\n` +
-      `• Автоматичні затримки між запитами\n` +
-      `• Ліміти на пошуки/покупки\n` +
-      `• Нічний режим (02:00-08:00)\n` +
-      `• Моніторинг ризику в реальному часі\n\n` +
-      `*Команди:*\n` +
-      `/accounts - Акаунти\n` +
-      `/filters - Фільтри\n` +
-      `/status - Статус та Anti-Ban\n` +
-      `/risk - Рівні ризику\n` +
-      `/settings - Налаштування\n` +
-      `/2fa <код> - Ввести 2FA код\n` +
-      `/captcha <рішення> - Ввести капчу\n\n` +
-      `⚠️ *Увага:* Використовуйте на свій ризик!`,
-      { parse_mode: 'Markdown' }
-    );
-  }
-
-  private async startFullLogin(ctx: BotContext): Promise<void> {
-    this.userStates.set(ctx.from!.id, {
-      step: 'full_login_email',
-      data: {}
-    });
-
-    await ctx.reply('📧 Введіть email EA акаунту:');
-  }
-
-  private async handle2FACode(ctx: BotContext, code: string): Promise<void> {
-    const callback = this.pending2FACodes.get(ctx.from!.id);
-    
-    if (callback) {
-      callback(code);
-      this.pending2FACodes.delete(ctx.from!.id);
-      await ctx.reply('✅ 2FA код відправлено!');
-    } else {
-      await ctx.reply('❌ Немає активного запиту на 2FA код');
-    }
-  }
-
-  // ... (решта методів залишається без змін)
-
-  private async showFilters(ctx: BotContext): Promise<void> {
-    if (!ctx.user) return;
-
-    const filters = await db.getFiltersByUser(ctx.user.id);
-
-    if (filters.length === 0) {
-      await ctx.reply(
-        '📭 У вас немає фільтрів.\n\nСтворіть перший фільтр:',
-        Markup.inlineKeyboard([
-          [Markup.button.callback('➕ Додати фільтр', 'add_filter')]
-        ])
-      );
-      return;
-    }
-
-    const buttons = filters.map(f => [
-      Markup.button.callback(
-        `${f.is_active ? '🟢' : '⏸'} ${f.name} | Max: ${f.max_buy.toLocaleString()}`,
-        `filter_${f.id}`
-      )
-    ]);
-
-    buttons.push([Markup.button.callback('➕ Додати фільтр', 'add_filter')]);
-
-    await ctx.reply(
-      `🎯 *Ваші фільтри:*`,
-      { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
-    );
-  }
-
-  private async showFilterDetails(ctx: BotContext, filterId: string): Promise<void> {
-    const filters = await db.getFiltersByUser(ctx.user!.id);
-    const filter = filters.find(f => f.id === filterId);
-
-    if (!filter) {
-      await ctx.reply('❌ Фільтр не знайдено');
-      return;
-    }
-
-    await ctx.editMessageText(
-      `🎯 *Фільтр: ${filter.name}*\n\n` +
-      `📊 Статус: ${filter.is_active ? '🟢 Активний' : '⏸ Вимкнено'}\n` +
-      `💰 Max Buy: ${filter.max_buy.toLocaleString()}\n` +
-      `💵 Sell Price: ${filter.sell_price?.toLocaleString() || 'Auto'}`,
-      {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-          [
-            filter.is_active
-              ? Markup.button.callback('⏸ Вимкнути', `toggle_filter_${filterId}_off`)
-              : Markup.button.callback('▶️ Увімкнути', `toggle_filter_${filterId}_on`)
-          ],
-          [Markup.button.callback('🗑 Видалити', `delete_filter_${filterId}`)],
-          [Markup.button.callback('« Назад', 'filters')]
-        ])
-      }
-    );
-  }
-
-  private async startAddFilter(ctx: BotContext): Promise<void> {
-    if (!ctx.user) return;
-
-    const accounts = await db.getEAAccountsByUser(ctx.user.id);
-    if (accounts.length === 0) {
-      await ctx.reply('❌ Спочатку додайте EA акаунт');
-      return;
-    }
-
-    this.userStates.set(ctx.from!.id, {
-      step: 'add_filter_account',
-      data: { accounts }
-    });
-
-    const buttons = accounts.map(acc => [
-      Markup.button.callback(
-        `${acc.platform.toUpperCase()} | ${acc.email}`,
-        `select_account_for_filter_${acc.id}`
-      )
-    ]);
-
-    await ctx.reply(
-      '🎯 *Новий фільтр*\n\nОберіть акаунт:',
-      { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
-    );
-  }
-
-  private async startSniper(ctx: BotContext): Promise<void> {
-    if (!ctx.user) return;
-
-    const accounts = await db.getEAAccountsByUser(ctx.user.id);
-    if (accounts.length === 0) {
-      await ctx.reply('❌ Спочатку додайте EA акаунт');
-      return;
-    }
-
-    const buttons = accounts.map(acc => {
-      const session = sniperEngine.getSession(acc.id);
-      const status = session?.status === 'running' ? '🟢' : '⏹';
-      const risk = antiBanService.getRiskPercentage(acc.id);
-      const riskEmoji = risk < 30 ? '🟢' : risk < 60 ? '🟡' : '🔴';
-      
-      return [
-        Markup.button.callback(
-          `${status} ${acc.platform.toUpperCase()} | ${acc.email} ${riskEmoji}`,
-          `start_sniper_${acc.id}`
-        )
-      ];
-    });
-
-    await ctx.reply(
-      '🚀 *Запуск снайпера*\n\nОберіть акаунт:',
-      { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
-    );
-  }
-
-  private async startSniperForAccount(ctx: BotContext, accountId: string): Promise<void> {
-    if (!ctx.user) return;
-
-    const success = await sniperEngine.startSession(accountId, ctx.user.id);
-
-    if (success) {
-      await ctx.reply('✅ Снайпер запущено!');
-    } else {
-      await ctx.reply('❌ Помилка запуску. Перевірте сесію.');
-    }
-  }
-
-  private async stopSniper(ctx: BotContext): Promise<void> {
-    if (!ctx.user) return;
-
-    const accounts = await db.getEAAccountsByUser(ctx.user.id);
-    const activeSessions = accounts.filter(acc => sniperEngine.getSession(acc.id));
-
-    if (activeSessions.length === 0) {
-      await ctx.reply('ℹ️ Немає активних сесій');
-      return;
-    }
-
-    for (const acc of activeSessions) {
-      await sniperEngine.stopSession(acc.id);
-    }
-
-    await ctx.reply('⏹ Всі снайпери зупинено');
-  }
-
-  private async showStats(ctx: BotContext): Promise<void> {
-    if (!ctx.user) return;
-
-    const history = await db.getStatsHistory(ctx.user.id, 7);
-    
-    if (history.length === 0) {
-      await ctx.reply('📊 Поки немає статистики');
-      return;
-    }
-
-    let statsText = '📈 *Статистика за 7 днів*\n\n';
-    let totalProfit = 0;
-
-    for (const stat of history) {
-      statsText += `📅 ${stat.date}\n`;
-      statsText += `├ Покупок: ${stat.purchases}\n`;
-      statsText += `├ Продажів: ${stat.sales}\n`;
-      statsText += `└ Прибуток: ${stat.profit.toLocaleString()}💰\n\n`;
-      totalProfit += stat.profit;
-    }
-
-    statsText += `*Всього прибуток:* ${totalProfit.toLocaleString()}💰`;
-
-    await ctx.reply(statsText, { parse_mode: 'Markdown' });
-  }
-
-  private async searchPrices(ctx: BotContext, query: string): Promise<void> {
-    await ctx.reply('🔍 Шукаю...');
-
-    const players = await priceService.searchPlayer(query);
-
-    if (players.length === 0) {
-      await ctx.reply('❌ Гравців не знайдено');
-      return;
-    }
-
-    const topPlayers = players.slice(0, 5);
-    let resultText = `🔍 *Результати для "${query}":*\n\n`;
-
-    for (const player of topPlayers) {
-      const price = await priceService.getPrice(player.id, 'ps');
-      
-      resultText += `*${player.name}* (${player.rating})\n`;
-      resultText += `├ ID: ${player.id}\n`;
-      resultText += `└ Ціна: ${price.lowestBin?.toLocaleString() || 'N/A'}💰\n\n`;
-    }
-
-    await ctx.reply(resultText, { parse_mode: 'Markdown' });
+    await ctx.reply(text, { parse_mode: 'Markdown' });
   }
 
   // ==========================================
-  // STATE HANDLERS
+  // CANCEL
   // ==========================================
 
-  private async handleState(ctx: BotContext, state: { step: string; data: any }): Promise<void> {
-    const text = (ctx.message as any).text;
-
-    switch (state.step) {
-      case 'add_account_email':
-        state.data.email = text;
-        state.step = 'add_account_platform';
-        await ctx.reply(
-          '🎮 Оберіть платформу:',
-          Markup.inlineKeyboard([
-            [Markup.button.callback('PlayStation', 'platform_ps')],
-            [Markup.button.callback('Xbox', 'platform_xbox')],
-            [Markup.button.callback('PC', 'platform_pc')]
-          ])
-        );
-        break;
-
-      case 'full_auth_email':
-        state.data.email = text;
-        state.step = 'full_auth_password';
-        await ctx.reply('🔑 Введіть пароль:');
-        break;
-
-      case 'full_auth_password':
-        state.data.password = text;
-        await ctx.reply('⏳ Авторизація...');
-        await this.performFullAuth(ctx, state.data);
-        break;
-
-      case 'refresh_auth_password':
-        state.data.password = text;
-        await ctx.reply('⏳ Оновлення сесії...');
-        await this.performFullAuth(ctx, state.data);
-        break;
-
-      case 'add_account_cookies':
-        await this.handleSIDInput(ctx, text, state.data);
-        break;
-
-      case 'update_cookies':
-        await this.handleSIDInput(ctx, text, state.data);
-        break;
-
-      case 'add_filter_name':
-        state.data.name = text;
-        state.step = 'add_filter_max_buy';
-        await ctx.reply('💰 Введіть максимальну ціну покупки:');
-        break;
-
-      case 'add_filter_max_buy':
-        const maxBuy = parseInt(text.replace(/\s/g, ''));
-        if (isNaN(maxBuy) || maxBuy <= 0) {
-          await ctx.reply('❌ Введіть коректне число:');
-          return;
-        }
-        state.data.maxBuy = maxBuy;
-        state.step = 'add_filter_sell_price';
-        await ctx.reply('💵 Введіть ціну продажу (або "auto"):');
-        break;
-
-      case 'add_filter_sell_price':
-        const sellPrice = text.toLowerCase() === 'auto' ? null : parseInt(text.replace(/\s/g, ''));
-        if (sellPrice !== null && (isNaN(sellPrice) || sellPrice <= 0)) {
-          await ctx.reply('❌ Введіть коректне число або "auto":');
-          return;
-        }
-
-        try {
-          await db.addFilter({
-            user_id: ctx.user!.id,
-            ea_account_id: state.data.accountId,
-            name: state.data.name,
-            player_id: null,
-            min_buy: null,
-            max_buy: state.data.maxBuy,
-            sell_price: sellPrice,
-            position: null,
-            quality: null,
-            rarity: null,
-            nation: null,
-            league: null,
-            club: null,
-            is_active: true
-          });
-
-          this.userStates.delete(ctx.from!.id);
-          await ctx.reply(
-            `✅ Фільтр створено!\n\n` +
-            `📝 Назва: ${state.data.name}\n` +
-            `💰 Max Buy: ${state.data.maxBuy.toLocaleString()}\n` +
-            `💵 Sell: ${sellPrice?.toLocaleString() || 'Auto'}\n\n` +
-            `Запустіть снайпер: /start_sniper`
-          );
-        } catch (error) {
-          await ctx.reply('❌ Помилка створення фільтра');
-          logger.error('Filter creation error:', error);
-        }
-        break;
-
-      default:
-        this.userStates.delete(ctx.from!.id);
-    }
-  }
-
-  private async performFullAuth(ctx: BotContext, data: any): Promise<void> {
-    const { email, password, platform, accountId } = data;
-
-    try {
-      // Create 2FA code provider
-      const get2FACode = (): Promise<string | null> => {
-        return new Promise((resolve) => {
-          this.pending2FACodes.set(ctx.from!.id, resolve);
-          ctx.reply(
-            '🔐 *Потрібен 2FA код!*\n\n' +
-            'Введіть код з email або SMS:\n' +
-            '`/2fa 123456`',
-            { parse_mode: 'Markdown' }
-          );
-
-          // Timeout after 5 minutes
-          setTimeout(() => {
-            if (this.pending2FACodes.has(ctx.from!.id)) {
-              this.pending2FACodes.delete(ctx.from!.id);
-              resolve(null);
-            }
-          }, 300000);
-        });
-      };
-
-      const result = await eaAuthManager.login(
-        accountId || 'new',
-        { email, password, platform },
-        get2FACode
-      );
-
-      if (result.success && result.session) {
-        // Save or update account
-        if (accountId) {
-          await db.updateEAAccountSession(accountId, {
-            cookies: result.cookies,
-            session_id: result.session.sid
-          });
-        } else {
-          await db.addEAAccount(
-            ctx.user!.id,
-            email,
-            platform,
-            result.cookies!
-          );
-        }
-
-        this.userStates.delete(ctx.from!.id);
-        await ctx.reply(
-          `✅ Авторизація успішна!\n\n` +
-          `📧 Email: ${email}\n` +
-          `🎮 Платформа: ${platform.toUpperCase()}\n` +
-          `🔑 SID: ${result.session.sid.substring(0, 8)}...\n\n` +
-          `Наступний крок: /filters`
-        );
-      } else {
-        await ctx.reply(`❌ Помилка авторизації: ${result.error}`);
-      }
-    } catch (error: any) {
-      logger.error('Full auth error:', error);
-      await ctx.reply(`❌ Помилка: ${error.message}`);
-    }
-  }
-
-  private async handleSIDInput(ctx: BotContext, text: string, data: any): Promise<void> {
-    let sid = text.trim();
-
-    // Try to extract SID from JSON if provided
-    if (text.includes('{')) {
-      try {
-        const parsed = JSON.parse(text);
-        sid = parsed.sid || parsed['X-UT-SID'] || text;
-      } catch (e) {
-        // Not JSON, use as-is
-      }
-    }
-
-    // Validate SID format
-    const sidRegex = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
-    if (!sidRegex.test(sid)) {
-      await ctx.reply(
-        '❌ Невірний формат SID!\n\n' +
-        'SID має виглядати так:\n' +
-        '`f1888c19-c261-4e8c-b49e-1e202c4a872f`',
-        { parse_mode: 'Markdown' }
-      );
-      return;
-    }
-
-    await ctx.reply('⏳ Перевіряю SID...');
-
-    const cookies = { sid };
-
-    try {
-      if (data.accountId) {
-        // Update existing account
-        await db.updateEAAccountSession(data.accountId, { cookies });
-        EAAPIFactory.removeInstance(data.accountId);
-
-        const api = await EAAPIFactory.getInstance(data.accountId);
-        if (api) {
-          const credits = await api.getCredits();
-          await db.updateEAAccountSession(data.accountId, { coins: credits.credits });
-          
-          this.userStates.delete(ctx.from!.id);
-          await ctx.reply(
-            `✅ SID оновлено!\n\n` +
-            `💰 Баланс: ${credits.credits.toLocaleString()} монет`
-          );
-        } else {
-          await ctx.reply('⚠️ SID збережено, але перевірка не вдалась');
-        }
-      } else {
-        // New account
-        const account = await db.addEAAccount(
-          ctx.user!.id,
-          data.email,
-          data.platform,
-          cookies
-        );
-
-        if (!account) {
-          await ctx.reply('❌ Помилка збереження акаунту');
-          return;
-        }
-
-        const api = await EAAPIFactory.getInstance(account.id);
-        if (api) {
-          const credits = await api.getCredits();
-          await db.updateEAAccountSession(account.id, { coins: credits.credits });
-          
-          this.userStates.delete(ctx.from!.id);
-          await ctx.reply(
-            `✅ Акаунт додано!\n\n` +
-            `📧 Email: ${data.email}\n` +
-            `🎮 Платформа: ${data.platform.toUpperCase()}\n` +
-            `💰 Баланс: ${credits.credits.toLocaleString()} монет\n\n` +
-            `Наступний крок: /add_filter`
-          );
-        } else {
-          this.userStates.delete(ctx.from!.id);
-          await ctx.reply(
-            `⚠️ Акаунт додано, але SID не вдалося перевірити.\n` +
-            `Можливо SID застарів.`
-          );
-        }
-      }
-    } catch (error) {
-      logger.error('SID handling error:', error);
-      await ctx.reply('❌ Помилка перевірки SID');
-    }
+  private async cancelAction(ctx: BotContext): Promise<void> {
+    this.userStates.delete(ctx.from!.id);
+    this.pending2FA.delete(ctx.from!.id);
+    await ctx.reply('✅ Дію скасовано.');
   }
 
   // ==========================================
   // HELPERS
   // ==========================================
 
-  private getMainKeyboard() {
-    return Markup.keyboard([
-      ['📱 Акаунти', '🎯 Фільтри'],
-      ['▶️ Старт', '⏹ Стоп'],
-      ['📊 Статус', '⚠️ Ризик']
-    ]).resize();
-  }
-
-  private async getAccountsByAccountId(accountId: string): Promise<EAAccount[]> {
-    const { data } = await (db as any)['client']
-      .from('ea_accounts')
-      .select('*')
-      .eq('id', accountId);
-    return data || [];
+  private getRiskEmoji(level: RiskLevel): string {
+    switch (level) {
+      case RiskLevel.LOW: return '🟢';
+      case RiskLevel.MEDIUM: return '🟡';
+      case RiskLevel.HIGH: return '🟠';
+      case RiskLevel.CRITICAL: return '🔴';
+      default: return '⚪';
+    }
   }
 
   // ==========================================
-  // START BOT
+  // LAUNCH
   // ==========================================
 
-  async start(): Promise<void> {
+  async launch(): Promise<void> {
     await this.bot.telegram.setMyCommands([
       { command: 'start', description: 'Почати роботу' },
       { command: 'accounts', description: 'Керування акаунтами' },
+      { command: 'add_account', description: 'Додати акаунт' },
       { command: 'filters', description: 'Керування фільтрами' },
-      { command: 'start_sniper', description: 'Запустити снайпер' },
-      { command: 'stop_sniper', description: 'Зупинити снайпер' },
+      { command: 'add_filter', description: 'Додати фільтр' },
       { command: 'status', description: 'Статус бота' },
       { command: 'risk', description: 'Рівні ризику' },
-      { command: 'settings', description: 'Налаштування Anti-Ban' },
-      { command: 'stats', description: 'Статистика' },
-      { command: 'prices', description: 'Перевірити ціни' },
+      { command: 'settings', description: 'Налаштування' },
       { command: '2fa', description: 'Ввести 2FA код' },
-      { command: 'help', description: 'Допомога' }
+      { command: 'help', description: 'Допомога' },
+      { command: 'cancel', description: 'Скасувати' }
     ]);
 
     await this.bot.launch();
     logger.info('🤖 Telegram bot v2.0 started');
-
-    process.once('SIGINT', () => this.bot.stop('SIGINT'));
-    process.once('SIGTERM', () => this.bot.stop('SIGTERM'));
-  }
-
-  async launch(): Promise<void> {
-    return this.start();
   }
 
   stop(signal?: string): void {
     this.bot.stop(signal);
   }
 }
-
-export const telegramBot = new TelegramBot();
