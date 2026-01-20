@@ -299,7 +299,7 @@ export class TelegramBot {
       }
     });
 
-    // Add account / filter buttons
+// Add account / filter buttons
     this.bot.action('add_account', async (ctx) => {
       await ctx.answerCbQuery();
       await this.startAddAccount(ctx);
@@ -308,6 +308,19 @@ export class TelegramBot {
     this.bot.action('add_filter', async (ctx) => {
       await ctx.answerCbQuery();
       await this.startAddFilter(ctx);
+    });
+
+    // Select account for filter
+    this.bot.action(/^select_account_for_filter_(.+)$/, async (ctx) => {
+      await ctx.answerCbQuery();
+      const accountId = ctx.match[1];
+      const state = this.userStates.get(ctx.from!.id);
+
+      if (state) {
+        state.data.accountId = accountId;
+        state.step = 'add_filter_name';
+        await ctx.reply('📝 Введіть назву фільтра:\n\nПриклад: Mbappe snipe');
+      }
     });
 
     // Main menu buttons
