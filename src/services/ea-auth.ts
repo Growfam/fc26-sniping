@@ -41,6 +41,7 @@ export interface LoginResult {
   error?: string;
   requires2FA?: boolean;
   twoFactorMethod?: string;
+  tfaUrl?: string;  // Save TFA URL for continuing
 }
 
 // ==========================================
@@ -133,12 +134,14 @@ export class EAAuth extends EventEmitter {
       // Step 3: Handle 2FA if required
       if (submitResult.requires2FA) {
         logger.info(`[EAAuth] 2FA required`);
-        
+
         if (!twoFactorProvider) {
+          // Return with tfaUrl so we can continue later
           return {
             success: false,
             requires2FA: true,
             twoFactorMethod: 'email',
+            tfaUrl: submitResult.tfaUrl,
             error: 'Потрібен 2FA код. Використайте /2fa <код>'
           };
         }
@@ -216,7 +219,7 @@ export class EAAuth extends EventEmitter {
   private async getLoginUrl(): Promise<{ success: boolean; loginUrl?: string; error?: string }> {
     try {
       logger.info('[EAAuth] Step 1: Getting login URL...');
-      
+
       // Simple approach: follow ALL redirects, get final URL
       const response = await this.client.get(EA_ENDPOINTS.ACCOUNTS_AUTH, {
         params: AUTH_PARAMS,
@@ -594,6 +597,69 @@ export class EAAuth extends EventEmitter {
     this.accessToken = null;
     this.cookieJar = new CookieJar();
   }
+
+  // Continue login after 2FA code received
+  async continueWith2FA(code: string, tfaUrl: string, platform: 'ps' | 'xbox' | 'pc'): Promise<LoginResult> {
+    try {
+      logger.info('[EAAuth] Continuing with 2FA code...');
+
+      // Submit 2FA code
+      const tfaResult = await this.submit2FA(code, tfaUrl);
+      if (!tfaResult.success) {
+        return tfaResult;
+      }
+
+      // Get access token
+      const tokenResult = await this.getAccessToken();
+      if (!tokenResult.success) {
+        return tokenResult;
+      }
+
+      this.accessToken = tokenResult.accessToken!;
+      logger.info('[EAAuth] Got access token after 2FA');
+
+      // Get persona ID
+      const identityResult = await this.getIdentity();
+      if (!identityResult.success) {
+        return identityResult;
+      }
+
+      logger.info(`[EAAuth] Got identity: persona=${identityResult.personaId}`);
+
+      // Authenticate to FUT
+      const futResult = await this.authenticateToFUT(platform, identityResult.personaId!);
+      if (!futResult.success) {
+        return futResult;
+      }
+
+      // Build session
+      this.currentSession = {
+        sid: futResult.sid!,
+        platform,
+        personaId: identityResult.personaId,
+        nucleusId: identityResult.nucleusId,
+        expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000)
+      };
+
+      const cookies: AuthCookies = {
+        sid: futResult.sid!,
+        platform,
+        createdAt: new Date().toISOString()
+      };
+
+      logger.info('[EAAuth] ✅ Login with 2FA successful!');
+
+      return {
+        success: true,
+        session: this.currentSession,
+        cookies
+      };
+
+    } catch (error: any) {
+      logger.error('[EAAuth] 2FA continuation error:', error.message);
+      return { success: false, error: `Помилка 2FA: ${error.message}` };
+    }
+  }
 }
 
 // ==========================================
@@ -602,10 +668,10 @@ export class EAAuth extends EventEmitter {
 
 class EAAuthManager {
   private authInstances: Map<string, EAAuth> = new Map();
-  private pending2FA: Map<string, {
+  private pendingLogins: Map<string, {
     auth: EAAuth;
     credentials: EACredentials;
-    resolve: (code: string) => void;
+    tfaUrl: string;
   }> = new Map();
 
   getAuth(accountId: string): EAAuth {
@@ -622,43 +688,45 @@ class EAAuthManager {
     const auth = new EAAuth();
     this.authInstances.set(tempId, auth);
 
-    return new Promise((resolve) => {
-      const twoFactorProvider = (): Promise<string | null> => {
-        return new Promise((tfaResolve) => {
-          this.pending2FA.set(tempId, {
-            auth,
-            credentials,
-            resolve: tfaResolve
-          });
+    // First attempt - without 2FA provider (will return requires2FA if needed)
+    const result = await auth.login(credentials);
 
-          auth.emit('2fa_required', { tempId, method: 'email' });
+    // If 2FA required, save state and return immediately
+    if (result.requires2FA) {
+      this.pendingLogins.set(tempId, {
+        auth,
+        credentials,
+        tfaUrl: result.tfaUrl || ''
+      });
+      logger.info(`[EAAuthManager] Saved pending 2FA for ${tempId}, tfaUrl: ${result.tfaUrl?.substring(0, 50)}`);
+      return result;
+    }
 
-          // Timeout after 5 minutes
-          setTimeout(() => {
-            if (this.pending2FA.has(tempId)) {
-              this.pending2FA.delete(tempId);
-              tfaResolve(null);
-            }
-          }, 5 * 60 * 1000);
-        });
-      };
+    return result;
+  }
 
-      auth.login(credentials, twoFactorProvider).then(resolve);
-    });
+  async continue2FALogin(tempId: string, code: string): Promise<LoginResult> {
+    const pending = this.pendingLogins.get(tempId);
+    if (!pending) {
+      return { success: false, error: 'Немає активного запиту на 2FA' };
+    }
+
+    const { auth, credentials, tfaUrl } = pending;
+
+    // Use the new continueWith2FA method
+    const result = await auth.continueWith2FA(code, tfaUrl, credentials.platform);
+
+    this.pendingLogins.delete(tempId);
+
+    return result;
   }
 
   submit2FACode(tempId: string, code: string): boolean {
-    const pending = this.pending2FA.get(tempId);
-    if (pending) {
-      pending.resolve(code);
-      this.pending2FA.delete(tempId);
-      return true;
-    }
-    return false;
+    return this.pendingLogins.has(tempId);
   }
 
   hasPending2FA(tempId: string): boolean {
-    return this.pending2FA.has(tempId);
+    return this.pendingLogins.has(tempId);
   }
 
   async verifySession(
@@ -676,7 +744,7 @@ class EAAuthManager {
       auth.clearSession();
     }
     this.authInstances.delete(accountId);
-    this.pending2FA.delete(accountId);
+    this.pendingLogins.delete(accountId);
   }
 }
 

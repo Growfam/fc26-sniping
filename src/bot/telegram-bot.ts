@@ -385,29 +385,26 @@ export class TelegramBot {
 
     await ctx.reply('⏳ Перевірка коду...');
 
-    const submitted = eaAuthManager.submit2FACode(tempId, code);
-    if (!submitted) {
-      await ctx.reply('❌ Не вдалося відправити код. Спробуйте заново /add_account');
+    try {
+      // Continue login with 2FA code
+      const result = await eaAuthManager.continue2FALogin(tempId, code);
+
+      if (!result.success) {
+        await ctx.reply(`❌ Помилка: ${result.error}`);
+        this.pending2FA.delete(ctx.from!.id);
+        this.userStates.delete(ctx.from!.id);
+        return;
+      }
+
+      // Success - save account
+      await this.saveAccount(ctx, result);
+
+    } catch (error: any) {
+      logger.error('2FA error:', error);
+      await ctx.reply(`❌ Помилка 2FA: ${error.message}`);
       this.pending2FA.delete(ctx.from!.id);
       this.userStates.delete(ctx.from!.id);
-      return;
     }
-
-    // Wait for result (login will continue in background)
-    await new Promise(resolve => setTimeout(resolve, 3000));
-    
-    // Check if account was created
-    const state = this.userStates.get(ctx.from!.id);
-    if (state?.step === 'completed') {
-      // Success was handled by saveAccount
-      return;
-    }
-
-    // If still waiting, inform user
-    await ctx.reply(
-      '⏳ Авторизація продовжується...\n\n' +
-      'Якщо через 30 секунд не буде відповіді - спробуйте заново.'
-    );
   }
 
   private async saveAccount(ctx: BotContext, result: any): Promise<void> {
@@ -434,9 +431,9 @@ export class TelegramBot {
       if (result.session?.sid) {
         const auth = eaAuthManager.getAuth(account.id);
         const credits = await auth.getCredits(result.session.sid, platform);
-        await db.updateEAAccountSession(account.id, { 
+        await db.updateEAAccountSession(account.id, {
           session_id: result.session.sid,
-          coins: credits 
+          coins: credits
         });
       }
 
@@ -465,7 +462,7 @@ export class TelegramBot {
 
   private async handleRefreshSession(ctx: any): Promise<void> {
     const accountId = ctx.match[1];
-    
+
     await ctx.answerCbQuery();
     await ctx.reply(
       '🔄 *Оновлення сесії*\n\n' +
@@ -481,7 +478,7 @@ export class TelegramBot {
 
   private async handleDeleteAccount(ctx: any): Promise<void> {
     const accountId = ctx.match[1];
-    
+
     await db.deleteEAAccount(accountId);
     await ctx.answerCbQuery('✅ Акаунт видалено');
     await this.showAccounts(ctx);
@@ -532,7 +529,7 @@ export class TelegramBot {
   private async handleFilterAction(ctx: any): Promise<void> {
     const filterId = ctx.match[1];
     const filter = await db.getFilterById(filterId);
-    
+
     if (!filter) {
       await ctx.answerCbQuery('Фільтр не знайдено');
       return;
@@ -546,7 +543,7 @@ export class TelegramBot {
       `💵 Sell: ${filter.sell_price?.toLocaleString() || 'Не вказано'}\n`;
 
     const toggleText = filter.is_active ? '⏸ Вимкнути' : '▶️ Увімкнути';
-    
+
     const keyboard = Markup.inlineKeyboard([
       [Markup.button.callback(toggleText, `toggle_filter_${filterId}`)],
       [Markup.button.callback('🗑 Видалити', `delete_filter_${filterId}`)],
@@ -559,7 +556,7 @@ export class TelegramBot {
   private async handleToggleFilter(ctx: any): Promise<void> {
     const filterId = ctx.match[1];
     const filter = await db.getFilterById(filterId);
-    
+
     if (!filter) {
       await ctx.answerCbQuery('Фільтр не знайдено');
       return;
@@ -567,7 +564,7 @@ export class TelegramBot {
 
     await db.toggleFilter(filterId, !filter.is_active);
     await ctx.answerCbQuery(filter.is_active ? 'Фільтр вимкнено' : 'Фільтр увімкнено');
-    
+
     // Refresh view
     ctx.match[1] = filterId;
     await this.handleFilterAction(ctx);
@@ -575,7 +572,7 @@ export class TelegramBot {
 
   private async handleDeleteFilter(ctx: any): Promise<void> {
     const filterId = ctx.match[1];
-    
+
     await db.deleteFilter(filterId);
     await ctx.answerCbQuery('✅ Фільтр видалено');
     await this.showFilters(ctx);
@@ -589,7 +586,7 @@ export class TelegramBot {
     if (!ctx.user) return;
 
     const accounts = await db.getEAAccountsByUser(ctx.user.id);
-    
+
     if (accounts.length === 0) {
       await ctx.reply('❌ Спочатку додайте акаунт: /add_account');
       return;
@@ -620,7 +617,7 @@ export class TelegramBot {
 
   private async handleFilterMaxBuy(ctx: BotContext, text: string): Promise<void> {
     const maxBuy = parseInt(text.replace(/[^0-9]/g, ''));
-    
+
     if (isNaN(maxBuy) || maxBuy < 150) {
       await ctx.reply('❌ Введіть коректну суму (мінімум 150):');
       return;
@@ -638,7 +635,7 @@ export class TelegramBot {
 
   private async handleFilterSellPrice(ctx: BotContext, text: string): Promise<void> {
     const state = this.userStates.get(ctx.from!.id)!;
-    
+
     if (text.toLowerCase() !== 'skip') {
       const sellPrice = parseInt(text.replace(/[^0-9]/g, ''));
       if (!isNaN(sellPrice) && sellPrice > 0) {
@@ -741,7 +738,7 @@ export class TelegramBot {
 
   private async showSettings(ctx: BotContext): Promise<void> {
     const cfg = config.antiBan;
-    
+
     const text = `⚙️ *Налаштування Anti-Ban*\n\n` +
       `*Затримки:*\n` +
       `├ Пошук: ${cfg.searchDelay.min/1000}-${cfg.searchDelay.max/1000}с\n` +
