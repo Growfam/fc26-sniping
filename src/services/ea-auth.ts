@@ -1,7 +1,7 @@
 /**
  * FC26 EA Authentication Service
- * Full email/password authentication with 2FA support
- * NO _csrf needed - EA uses execution token from URL
+ * Hybrid approach: User logs in via browser, provides SID
+ * EA uses Device Fingerprint (df) that cannot be replicated without real browser
  */
 
 import axios, { AxiosInstance } from 'axios';
@@ -342,15 +342,10 @@ export class EAAuth extends EventEmitter {
 
       // If we reached step 3+, password was accepted! This is 2FA page
       if (execStep >= 3) {
-        logger.info('[EAAuth] ✅ Password accepted! Now on 2FA page (step 3+)');
+        logger.info('[EAAuth] ✅ Password accepted! Now on 2FA page (step 3)');
+        logger.info('[EAAuth] User needs to open link and click SEND CODE manually');
 
-        // Try to send verification code automatically
-        const sendResult = await this.requestSendCode(finalUrl, html);
-        if (sendResult.newUrl) {
-          logger.info('[EAAuth] Code send requested, new URL: ' + sendResult.newUrl.substring(0, 60));
-          return { success: true, requires2FA: true, tfaUrl: sendResult.newUrl };
-        }
-
+        // Return s3 URL - user must click SEND CODE in browser
         return { success: true, requires2FA: true, tfaUrl: finalUrl };
       }
 

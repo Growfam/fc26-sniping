@@ -89,19 +89,20 @@ export class TelegramBot {
   // ==========================================
 
   private setupCallbacks(): void {
-    // Platform selection
+    // Platform selection for add account
+    this.bot.action(/^addacc_(.+)$/, (ctx) => this.handleAddAccPlatform(ctx));
     this.bot.action(/^platform_(.+)$/, (ctx) => this.handlePlatformSelect(ctx));
-    
+
     // Account actions
     this.bot.action(/^account_(.+)$/, (ctx) => this.handleAccountAction(ctx));
     this.bot.action(/^refresh_(.+)$/, (ctx) => this.handleRefreshSession(ctx));
     this.bot.action(/^delete_acc_(.+)$/, (ctx) => this.handleDeleteAccount(ctx));
-    
+
     // Filter actions
     this.bot.action(/^filter_(.+)$/, (ctx) => this.handleFilterAction(ctx));
     this.bot.action(/^toggle_filter_(.+)$/, (ctx) => this.handleToggleFilter(ctx));
     this.bot.action(/^delete_filter_(.+)$/, (ctx) => this.handleDeleteFilter(ctx));
-    
+
     // Navigation
     this.bot.action('back_to_accounts', (ctx) => this.showAccounts(ctx));
     this.bot.action('back_to_filters', (ctx) => this.showFilters(ctx));
@@ -120,13 +121,17 @@ export class TelegramBot {
 
       const message = ctx.message as any;
       const text = (message?.text || '').trim();
-      
+
       // Skip if it's a command
       if (text.startsWith('/')) return;
 
       switch (state.step) {
         case 'email':
+        case 'sid_email':
           await this.handleEmailInput(ctx as any, text);
+          break;
+        case 'sid_input':
+          await this.handleSidInput(ctx as any, text);
           break;
         case 'password':
           await this.handlePasswordInput(ctx as any, text);
@@ -152,7 +157,7 @@ export class TelegramBot {
     logger.info(`[Bot] /start command from ${ctx.from?.id}`);
     await ctx.reply(
       `👋 *Вітаю у FC26 Sniper Bot v2.0!*\n\n` +
-      `🔐 *Авторизація:* Email + Password + 2FA\n` +
+      `🔐 *Авторизація:* через SID (Web App)\n` +
       `🛡️ *Anti-Ban:* Захист від блокування\n` +
       `⚡ *Швидкість:* 7-15 сек між запитами\n\n` +
       `*Почати роботу:*\n` +
@@ -212,7 +217,7 @@ export class TelegramBot {
     for (const acc of accounts) {
       const riskInfo = antiBanService.getStats(acc.id);
       const riskEmoji = this.getRiskEmoji(riskInfo?.riskLevel || RiskLevel.LOW);
-      
+
       text += `${riskEmoji} *${acc.email}*\n`;
       text += `├ Платформа: ${acc.platform.toUpperCase()}\n`;
       text += `├ Монети: ${acc.coins.toLocaleString()}\n`;
@@ -233,7 +238,7 @@ export class TelegramBot {
   private async handleAccountAction(ctx: any): Promise<void> {
     const accountId = ctx.match[1];
     const account = await db.getEAAccountById(accountId);
-    
+
     if (!account) {
       await ctx.answerCbQuery('Акаунт не знайдено');
       return;
@@ -258,21 +263,39 @@ export class TelegramBot {
   }
 
   // ==========================================
-  // ADD ACCOUNT FLOW
+  // ADD ACCOUNT FLOW (Hybrid - user provides SID)
   // ==========================================
 
   private async startAddAccount(ctx: BotContext): Promise<void> {
     logger.info(`[Bot] /add_account command from ${ctx.from?.id}`);
-    
-    this.userStates.set(ctx.from!.id, {
-      step: 'email',
-      data: {}
-    });
+
+    const keyboard = Markup.inlineKeyboard([
+      [
+        Markup.button.callback('🎮 PlayStation', 'addacc_ps'),
+        Markup.button.callback('🎮 Xbox', 'addacc_xbox')
+      ],
+      [Markup.button.callback('💻 PC', 'addacc_pc')]
+    ]);
 
     await ctx.reply(
-      '📧 *Додавання акаунта*\n\n' +
-      'Введіть email вашого EA акаунта:',
-      { parse_mode: 'Markdown' }
+      '📱 *Додавання акаунта EA*\n\n' +
+      'Виберіть платформу:',
+      { parse_mode: 'Markdown', ...keyboard }
+    );
+  }
+
+  private async handleAddAccPlatform(ctx: any): Promise<void> {
+    const platform = ctx.match[1] as 'ps' | 'xbox' | 'pc';
+    await ctx.answerCbQuery();
+
+    this.userStates.set(ctx.from!.id, {
+      step: 'sid_email',
+      data: { platform }
+    });
+
+    await ctx.editMessageText(
+      '📧 Введіть email вашого EA акаунта:\n\n' +
+      '(потрібен для ідентифікації)'
     );
   }
 
@@ -284,40 +307,103 @@ export class TelegramBot {
 
     const state = this.userStates.get(ctx.from!.id)!;
     state.data.email = email;
-    state.step = 'platform';
+    state.step = 'sid_input';
 
-    const keyboard = Markup.inlineKeyboard([
-      [
-        Markup.button.callback('🎮 PlayStation', 'platform_ps'),
-        Markup.button.callback('🎮 Xbox', 'platform_xbox')
-      ],
-      [Markup.button.callback('💻 PC', 'platform_pc')]
-    ]);
-
-    await ctx.reply('🎮 Виберіть платформу:', keyboard);
-  }
-
-  private async handlePlatformSelect(ctx: any): Promise<void> {
-    const platform = ctx.match[1] as 'ps' | 'xbox' | 'pc';
-    const state = this.userStates.get(ctx.from!.id);
-
-    if (!state || state.step !== 'platform') {
-      await ctx.answerCbQuery('Сесія застаріла. Почніть заново /add_account');
-      return;
-    }
-
-    state.data.platform = platform;
-    state.step = 'password';
-
-    await ctx.answerCbQuery();
     await ctx.reply(
-      '🔐 Введіть пароль від EA акаунта:\n\n' +
-      '⚠️ Пароль використовується тільки для авторизації і НЕ зберігається.',
-      { parse_mode: 'Markdown' }
+      '🔑 *Як отримати SID:*\n\n' +
+      '1️⃣ Відкрийте в браузері:\n' +
+      'ea.com/ea-sports-fc/ultimate-team/web-app\n\n' +
+      '2️⃣ Залогіньтесь повністю (включно з 2FA)\n\n' +
+      '3️⃣ Натисніть F12 (DevTools)\n\n' +
+      '4️⃣ Вкладка Network → Filter: ut/game\n\n' +
+      '5️⃣ Знайдіть будь-який запит → Headers\n\n' +
+      '6️⃣ Скопіюйте значення X-UT-SID\n\n' +
+      '📝 Вставте SID сюди:'
     );
   }
 
+  private async handleSidInput(ctx: BotContext, sid: string): Promise<void> {
+    const state = this.userStates.get(ctx.from!.id);
+    if (!state) return;
+
+    // Basic SID validation
+    if (sid.length < 30) {
+      await ctx.reply('❌ SID занадто короткий. Перевірте і спробуйте ще раз.');
+      return;
+    }
+
+    const { email, platform } = state.data;
+
+    await ctx.reply('⏳ Перевірка SID...');
+
+    try {
+      // Verify SID works
+      const auth = eaAuthManager.getAuth('temp_verify');
+      const isValid = await auth.verifySession(sid, platform);
+
+      if (!isValid) {
+        await ctx.reply(
+          '❌ SID недійсний або застарів.\n\n' +
+          'Переконайтесь що:\n' +
+          '• Ви скопіювали повний SID\n' +
+          '• Web App ще відкритий\n' +
+          '• Пройшло менше 1 години\n\n' +
+          'Спробуйте отримати новий SID.'
+        );
+        return;
+      }
+
+      // Get coins
+      const coins = await auth.getCredits(sid, platform);
+
+      // Save account
+      const account = await db.addEAAccount(
+        ctx.user!.id,
+        email,
+        platform,
+        {
+          sid,
+          platform,
+          createdAt: new Date().toISOString()
+        }
+      );
+
+      if (!account) {
+        await ctx.reply('❌ Помилка збереження акаунту');
+        this.userStates.delete(ctx.from!.id);
+        return;
+      }
+
+      // Update coins
+      await db.updateAccountCoins(account.id, coins);
+
+      this.userStates.delete(ctx.from!.id);
+
+      await ctx.reply(
+        '✅ *Акаунт додано успішно!*\n\n' +
+        `📧 Email: ${email}\n` +
+        `🎮 Платформа: ${platform.toUpperCase()}\n` +
+        `💰 Монети: ${coins.toLocaleString()}\n\n` +
+        'Тепер можете налаштувати снайпер /sniper',
+        { parse_mode: 'Markdown' }
+      );
+
+    } catch (error: any) {
+      logger.error('SID verification error:', error);
+      await ctx.reply(`❌ Помилка: ${error.message}`);
+      this.userStates.delete(ctx.from!.id);
+    }
+  }
+
+  private async handlePlatformSelect(ctx: any): Promise<void> {
+    // Legacy - redirect to new flow
+    await this.handleAddAccPlatform(ctx);
+  }
+
   private async handlePasswordInput(ctx: BotContext, password: string): Promise<void> {
+    // Legacy - not used in hybrid flow
+    await ctx.reply('Авторизація через пароль тимчасово недоступна. Використайте SID.');
+  }
     const state = this.userStates.get(ctx.from!.id);
     if (!state || state.step !== 'password') return;
 
@@ -332,7 +418,7 @@ export class TelegramBot {
     await ctx.reply('⏳ Авторизація в EA...');
 
     const credentials: EACredentials = { email, password, platform };
-    
+
     try {
       const result = await eaAuthManager.loginWithCredentials(tempId, credentials);
 
@@ -342,14 +428,15 @@ export class TelegramBot {
         state.data.tfaTimestamp = Date.now();
         state.data.tfaUrl = result.tfaUrl;
 
+        // Always show link - user must click SEND CODE
         await ctx.reply(
           '🔐 Потрібен 2FA код\n\n' +
-          '📧 Код надіслано на вашу пошту!\n' +
-          '(перевірте також папку Спам)\n\n' +
-          'Введіть код командою:\n' +
-          '/2fa XXXXXX\n\n' +
-          '⏱ Код дійсний 10 хвилин\n' +
-          '🔄 Не прийшов? Почніть заново /add_account'
+          '1. Відкрийте посилання:\n' +
+          result.tfaUrl + '\n\n' +
+          '2. Натисніть SEND CODE\n' +
+          '3. Перевірте пошту\n' +
+          '4. Введіть: /2fa КОД\n\n' +
+          'Приклад: /2fa 123456'
         );
         return;
       }
