@@ -251,7 +251,7 @@ export class TelegramBot {
       await this.showStatus(ctx);
     });
 
-    // Platform selection
+// Platform selection
     this.bot.action(/^platform_(.+)$/, async (ctx) => {
       const platform = ctx.match[1] as 'ps' | 'xbox' | 'pc';
       const state = this.userStates.get(ctx.from!.id);
@@ -259,10 +259,15 @@ export class TelegramBot {
         state.data.platform = platform;
         state.step = 'add_account_cookies';
         await ctx.reply(
-          '🍪 *Надішліть cookies*\n\n' +
-          'Формат JSON:\n' +
-          '```json\n{\n  "sid": "your_session_id",\n  "personaId": "your_persona_id",\n  "nucleusId": "your_nucleus_id"\n}\n```',
-          { parse_mode: 'Markdown' }
+          '🍪 Надішліть cookies\n\n' +
+          'Як отримати:\n' +
+          '1. Відкрийте https://www.ea.com/ea-sports-fc/ultimate-team/web-app\n' +
+          '2. Увійдіть в акаунт\n' +
+          '3. Натисніть F12 (DevTools)\n' +
+          '4. Вкладка Application - Cookies - ea.com\n' +
+          '5. Скопіюйте значення sid, personaId, nucleusId\n\n' +
+          'Надішліть у форматі:\n' +
+          '{"sid":"xxx","personaId":"xxx","nucleusId":"xxx"}'
         );
       }
     });
