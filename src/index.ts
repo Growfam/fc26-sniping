@@ -1,83 +1,39 @@
+/**
+ * FC26 Sniper Bot - Entry Point
+ */
+
 import { config, validateConfig } from './config';
-import { telegramBot } from './bot/telegram-bot';
-import { sniperEngine } from './services/sniper-engine';
+import { TelegramBot } from './bot/telegram-bot';
 import { logger } from './utils/logger';
 
-// ==========================================
-// MAIN APPLICATION
-// ==========================================
-async function main(): Promise<void> {
-  console.log(`
-  ╔═══════════════════════════════════════════╗
-  ║     FC26 ULTIMATE SNIPER BOT v1.0.0       ║
-  ║         Professional Trading Bot           ║
-  ╚═══════════════════════════════════════════╝
-  `);
-
+async function main() {
   try {
-    // Validate configuration
-    logger.info('Validating configuration...');
-    validateConfig();
-    logger.info('✅ Configuration valid');
-
-    // Initialize services
-    logger.info('Initializing services...');
+    logger.info('🚀 Starting FC26 Sniper Bot v2.0...');
     
-    // Start Telegram bot
-    logger.info('Starting Telegram bot...');
-    await telegramBot.start();
-    logger.info('✅ Telegram bot started');
+    // Validate configuration
+    validateConfig();
+    logger.info('✅ Configuration validated');
 
-    // Setup graceful shutdown
-    setupGracefulShutdown();
+    // Initialize Telegram bot
+    const bot = new TelegramBot();
+    await bot.launch();
+    
+    logger.info('✅ Bot launched successfully!');
 
-    logger.info('🚀 FC26 Ultimate Sniper Bot is running!');
-    logger.info(`Environment: ${config.logging.nodeEnv}`);
+    // Graceful shutdown
+    const shutdown = async (signal: string) => {
+      logger.info(`${signal} received. Shutting down...`);
+      bot.stop(signal);
+      process.exit(0);
+    };
+
+    process.once('SIGINT', () => shutdown('SIGINT'));
+    process.once('SIGTERM', () => shutdown('SIGTERM'));
 
   } catch (error) {
-    logger.error('Failed to start application:', error);
+    logger.error('❌ Failed to start bot:', error);
     process.exit(1);
   }
 }
 
-// ==========================================
-// GRACEFUL SHUTDOWN
-// ==========================================
-function setupGracefulShutdown(): void {
-  const shutdown = async (signal: string) => {
-    logger.info(`Received ${signal}. Shutting down gracefully...`);
-
-    try {
-      // Stop all sniper sessions
-      const sessions = sniperEngine.getAllSessions();
-      for (const session of sessions) {
-        await sniperEngine.stopSession(session.accountId);
-      }
-      logger.info('✅ All sniper sessions stopped');
-
-      logger.info('👋 Goodbye!');
-      process.exit(0);
-    } catch (error) {
-      logger.error('Error during shutdown:', error);
-      process.exit(1);
-    }
-  };
-
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
-  
-  // Handle uncaught exceptions
-  process.on('uncaughtException', (error) => {
-    logger.error('Uncaught Exception:', error);
-    shutdown('uncaughtException');
-  });
-
-  process.on('unhandledRejection', (reason, promise) => {
-    logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
-  });
-}
-
-// ==========================================
-// START
-// ==========================================
 main();

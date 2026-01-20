@@ -1,45 +1,48 @@
-import { EAAPI, EAAPIFactory, AuctionItem, SearchFilter } from './ea-api';
-import { priceService, PlayerPrice } from './price-service';
-import { db, SniperFilter, Transaction } from '../database';
-import { config } from '../config';
-import { logger } from '../utils/logger';
+/**
+ * FC26 Sniper Engine
+ * Main sniping logic with Anti-Ban integration
+ */
+
 import { EventEmitter } from 'events';
+import { EAAPI, EAAPIFactory } from './ea-api';
+import { antiBanService, AntiBanAction, RiskLevel } from './anti-ban';
+import { db } from '../database';
+import { logger } from '../utils/logger';
+import { config } from '../config';
 
 // ==========================================
 // TYPES
 // ==========================================
+
 export interface SniperSession {
   accountId: string;
   userId: string;
   status: 'running' | 'paused' | 'stopped' | 'error';
-  filters: SniperFilter[];
+  startedAt: Date;
   stats: {
     searches: number;
     purchases: number;
-    spent: number;
-    listings: number;
+    sales: number;
     profit: number;
+    errors: number;
   };
-  startTime: Date;
-  lastActivity: Date;
-  error?: string;
 }
 
-export interface SnipeResult {
-  success: boolean;
-  item?: AuctionItem;
-  buyPrice?: number;
-  sellPrice?: number;
-  profit?: number;
-  error?: string;
+export interface SearchResult {
+  tradeId: number;
+  buyNowPrice: number;
+  currentBid: number;
+  expires: number;
+  itemData: any;
 }
 
 // ==========================================
 // SNIPER ENGINE
 // ==========================================
-export class SniperEngine extends EventEmitter {
+
+class SniperEngine extends EventEmitter {
   private sessions: Map<string, SniperSession> = new Map();
-  private intervals: Map<string, NodeJS.Timeout> = new Map();
+  private searchLoops: Map<string, NodeJS.Timeout> = new Map();
 
   constructor() {
     super();
@@ -49,536 +52,353 @@ export class SniperEngine extends EventEmitter {
   // SESSION MANAGEMENT
   // ==========================================
 
-  /**
-   * Start sniping session for an account
-   */
   async startSession(accountId: string, userId: string): Promise<boolean> {
-    if (this.sessions.has(accountId)) {
-      const existing = this.sessions.get(accountId)!;
-      if (existing.status === 'running') {
-        return true; // Already running
-      }
-    }
-
-    // Get EA API instance
-    const api = await EAAPIFactory.getInstance(accountId);
-    if (!api) {
-      logger.error(`Failed to get EA API for account ${accountId}`);
-      return false;
-    }
-
-    // Verify session
     try {
-      const credits = await api.getCredits();
-      logger.info(`Session verified. Coins: ${credits.credits}`);
+      // Check if already running
+      if (this.sessions.has(accountId)) {
+        const session = this.sessions.get(accountId)!;
+        if (session.status === 'running') {
+          logger.warn(`Session already running for ${accountId}`);
+          return false;
+        }
+      }
+
+      // Initialize EA API
+      const api = await EAAPIFactory.getInstance(accountId);
+      if (!api) {
+        logger.error(`Failed to get API instance for ${accountId}`);
+        return false;
+      }
+
+      // Verify session
+      const isValid = await api.verifySession();
+      if (!isValid) {
+        logger.error(`Invalid session for ${accountId}`);
+        this.emit('session_expired', { accountId });
+        return false;
+      }
+
+      // Create session
+      const session: SniperSession = {
+        accountId,
+        userId,
+        status: 'running',
+        startedAt: new Date(),
+        stats: {
+          searches: 0,
+          purchases: 0,
+          sales: 0,
+          profit: 0,
+          errors: 0
+        }
+      };
+
+      this.sessions.set(accountId, session);
+
+      // Initialize Anti-Ban tracking
+      antiBanService.initSession(accountId);
+
+      // Start search loop
+      this.startSearchLoop(accountId);
+
+      logger.info(`Sniper session started for ${accountId}`);
+      this.emit('session_started', { accountId, userId });
+
+      return true;
     } catch (error) {
-      logger.error(`Session verification failed:`, error);
-      this.emit('session_error', { accountId, error: 'SESSION_EXPIRED' });
+      logger.error(`Failed to start session for ${accountId}:`, error);
       return false;
     }
-
-    // Load active filters
-    const filters = await db.getActiveFilters(accountId);
-    if (filters.length === 0) {
-      logger.warn(`No active filters for account ${accountId}`);
-    }
-
-    // Create session
-    const session: SniperSession = {
-      accountId,
-      userId,
-      status: 'running',
-      filters,
-      stats: {
-        searches: 0,
-        purchases: 0,
-        spent: 0,
-        listings: 0,
-        profit: 0
-      },
-      startTime: new Date(),
-      lastActivity: new Date()
-    };
-
-    this.sessions.set(accountId, session);
-
-    // Start sniper loop
-    this.startSniperLoop(accountId, api);
-
-    this.emit('session_started', { accountId, userId });
-    logger.info(`Sniper session started for account ${accountId}`);
-
-    return true;
   }
 
-  /**
-   * Stop sniping session
-   */
   async stopSession(accountId: string): Promise<void> {
     const session = this.sessions.get(accountId);
     if (!session) return;
 
+    // Stop search loop
+    const loop = this.searchLoops.get(accountId);
+    if (loop) {
+      clearTimeout(loop);
+      this.searchLoops.delete(accountId);
+    }
+
     session.status = 'stopped';
-
-    // Clear interval
-    const interval = this.intervals.get(accountId);
-    if (interval) {
-      clearInterval(interval);
-      this.intervals.delete(accountId);
-    }
-
-    // Save final stats
-    await db.updateDailyStats(session.userId, accountId, {
-      searches: session.stats.searches,
-      purchases: session.stats.purchases,
-      profit: session.stats.profit
-    });
-
-    this.sessions.delete(accountId);
-    this.emit('session_stopped', { accountId });
-    logger.info(`Sniper session stopped for account ${accountId}`);
+    
+    logger.info(`Sniper session stopped for ${accountId}`);
+    this.emit('session_stopped', { accountId, stats: session.stats });
   }
 
-  /**
-   * Pause session
-   */
-  pauseSession(accountId: string): void {
-    const session = this.sessions.get(accountId);
-    if (session) {
-      session.status = 'paused';
-      this.emit('session_paused', { accountId });
-    }
-  }
-
-  /**
-   * Resume session
-   */
-  resumeSession(accountId: string): void {
-    const session = this.sessions.get(accountId);
-    if (session && session.status === 'paused') {
-      session.status = 'running';
-      this.emit('session_resumed', { accountId });
-    }
-  }
-
-  /**
-   * Get session status
-   */
   getSession(accountId: string): SniperSession | undefined {
     return this.sessions.get(accountId);
   }
 
-  /**
-   * Get all active sessions
-   */
   getAllSessions(): SniperSession[] {
     return Array.from(this.sessions.values());
   }
 
   // ==========================================
-  // SNIPER LOOP
+  // SEARCH LOOP
   // ==========================================
 
-  private startSniperLoop(accountId: string, api: EAAPI): void {
-    const runCycle = async () => {
-      const session = this.sessions.get(accountId);
-      if (!session || session.status !== 'running') return;
-
-      try {
-        // Process each filter
-        for (const filter of session.filters) {
-          if (session.status !== 'running') break;
-
-          await this.processFilter(accountId, api, filter, session);
-        }
-
-        // Manage tradepile
-        await this.manageTradepile(accountId, api, session);
-
-        // Update last activity
-        session.lastActivity = new Date();
-
-        // Anti-ban pause
-        if (session.stats.purchases > 0 && 
-            session.stats.purchases % config.trading.maxPurchasesPerHour === 0) {
-          logger.info(`Anti-ban pause for account ${accountId}`);
-          session.status = 'paused';
-          setTimeout(() => {
-            if (this.sessions.has(accountId)) {
-              this.resumeSession(accountId);
-            }
-          }, 60000); // 1 minute pause
-        }
-
-      } catch (error: any) {
-        await this.handleError(accountId, session, error);
-      }
-    };
-
-    // Run immediately
-    runCycle();
-
-    // Set interval for continuous sniping
-    const interval = setInterval(runCycle, this.getRandomDelay());
-    this.intervals.set(accountId, interval);
-  }
-
-  private getRandomDelay(): number {
-    return Math.floor(
-      Math.random() * (config.trading.maxSearchDelay - config.trading.minSearchDelay) +
-      config.trading.minSearchDelay
-    );
-  }
-
-  // ==========================================
-  // FILTER PROCESSING
-  // ==========================================
-
-  private async processFilter(
-    accountId: string,
-    api: EAAPI,
-    filter: SniperFilter,
-    session: SniperSession
-  ): Promise<void> {
-    // Build search criteria
-    const searchFilter: SearchFilter = {
-      type: 'player',
-      maxBuy: filter.max_buy,
-      count: 21
-    };
-
-    if (filter.player_id) searchFilter.maskedDefId = filter.player_id;
-    if (filter.min_buy) searchFilter.minBuy = filter.min_buy;
-    if (filter.position) searchFilter.position = filter.position;
-    if (filter.nation) searchFilter.nationId = filter.nation;
-    if (filter.league) searchFilter.leagueId = filter.league;
-    if (filter.club) searchFilter.clubId = filter.club;
+  private async startSearchLoop(accountId: string): Promise<void> {
+    const session = this.sessions.get(accountId);
+    if (!session || session.status !== 'running') return;
 
     try {
-      // Search market
-      const results = await api.search(searchFilter);
-      session.stats.searches++;
+      // Check Anti-Ban decision
+      const decision = await antiBanService.shouldProceed(accountId, 'search');
 
-      if (results.auctionInfo.length === 0) return;
+      switch (decision.action) {
+        case AntiBanAction.STOP:
+          logger.warn(`[${accountId}] Anti-Ban STOP: ${decision.reason}`);
+          session.status = 'stopped';
+          this.emit('anti_ban_stop', { accountId, reason: decision.reason });
+          return;
 
-      // Process each item
-      for (const item of results.auctionInfo) {
-        if (session.status !== 'running') break;
-
-        // Check if item is a good deal
-        const shouldBuy = await this.evaluateItem(item, filter, api.platform);
-        
-        if (shouldBuy) {
-          const result = await this.attemptPurchase(api, item, filter, session);
+        case AntiBanAction.PAUSE:
+          logger.info(`[${accountId}] Anti-Ban PAUSE: ${decision.reason} (${decision.pauseMs}ms)`);
+          session.status = 'paused';
+          this.emit('anti_ban_pause', { accountId, reason: decision.reason, duration: decision.pauseMs });
           
-          if (result.success) {
-            // Record transaction
-            await this.recordPurchase(session, filter, item, result);
-            
-            // Emit event
-            this.emit('item_purchased', {
-              accountId,
-              item,
-              buyPrice: result.buyPrice,
-              sellPrice: result.sellPrice
-            });
+          // Schedule resume
+          this.searchLoops.set(accountId, setTimeout(() => {
+            session.status = 'running';
+            this.startSearchLoop(accountId);
+          }, decision.pauseMs!));
+          return;
 
-            // List for sale if auto-sell enabled
-            if (filter.sell_price) {
-              await this.listItem(api, item, filter.sell_price, session);
-            }
-          }
-        }
+        case AntiBanAction.DELAY:
+          // Wait for delay then proceed
+          await this.delay(decision.delayMs!);
+          break;
+
+        case AntiBanAction.PROCEED:
+          // Continue immediately
+          break;
       }
 
+      // Perform search
+      await this.performSearch(accountId);
+
+      // Schedule next iteration with random delay
+      const nextDelay = this.randomDelay(
+        config.antiBan.searchDelay.min,
+        config.antiBan.searchDelay.max
+      );
+
+      this.searchLoops.set(accountId, setTimeout(() => {
+        this.startSearchLoop(accountId);
+      }, nextDelay));
+
     } catch (error) {
-      throw error;
+      logger.error(`[${accountId}] Search loop error:`, error);
+      session.stats.errors++;
+      
+      // Handle error with Anti-Ban
+      const errorDecision = antiBanService.recordError(accountId, 0);
+      
+      if (errorDecision.action === AntiBanAction.STOP) {
+        session.status = 'error';
+        this.emit('session_error', { accountId, error });
+      } else {
+        // Retry after delay
+        this.searchLoops.set(accountId, setTimeout(() => {
+          this.startSearchLoop(accountId);
+        }, 30000));
+      }
     }
   }
 
   // ==========================================
-  // ITEM EVALUATION
+  // SEARCH & BUY LOGIC
   // ==========================================
 
-  private async evaluateItem(
-    item: AuctionItem,
-    filter: SniperFilter,
-    platform: string
-  ): Promise<boolean> {
-    // Basic checks
-    if (item.tradeState !== 'active') return false;
-    if (item.buyNowPrice > filter.max_buy) return false;
-    if (filter.min_buy && item.buyNowPrice < filter.min_buy) return false;
+  private async performSearch(accountId: string): Promise<void> {
+    const session = this.sessions.get(accountId);
+    if (!session) return;
 
-    // Check profit margin using external prices
-    if (filter.player_id) {
-      const priceData = await priceService.getPrice(filter.player_id, platform);
-      
-      if (priceData.lowestBin) {
-        const potentialProfit = priceData.lowestBin - item.buyNowPrice;
-        const profitPercent = (potentialProfit / item.buyNowPrice) * 100;
+    const api = await EAAPIFactory.getInstance(accountId);
+    if (!api) return;
 
-        // Check minimum profit margin
-        if (profitPercent < config.trading.minProfitMargin) {
-          return false;
+    // Get active filters for this account
+    const filters = await db.getFiltersByAccount(accountId);
+    const activeFilters = filters.filter(f => f.is_active);
+
+    if (activeFilters.length === 0) {
+      logger.debug(`[${accountId}] No active filters`);
+      return;
+    }
+
+    for (const filter of activeFilters) {
+      try {
+        // Build search parameters
+        const searchParams = this.buildSearchParams(filter);
+        
+        // Perform search
+        const results = await api.search(searchParams);
+        session.stats.searches++;
+
+        if (!results || results.length === 0) {
+          continue;
         }
+
+        // Check for snipes
+        for (const item of results) {
+          if (this.isSnipe(item, filter)) {
+            await this.attemptPurchase(accountId, item, filter);
+          }
+        }
+
+      } catch (error: any) {
+        logger.error(`[${accountId}] Search error for filter ${filter.name}:`, error);
+        
+        // Handle specific error codes
+        if (error.response?.status) {
+          antiBanService.recordError(accountId, error.response.status);
+        }
+      }
+    }
+  }
+
+  private buildSearchParams(filter: any): any {
+    const params: any = {
+      type: 'player',
+      maxb: filter.max_buy
+    };
+
+    if (filter.player_id) params.maskedDefId = filter.player_id;
+    if (filter.min_buy) params.minb = filter.min_buy;
+    if (filter.position) params.pos = filter.position;
+    if (filter.quality) params.quality = filter.quality;
+    if (filter.rarity) params.rarityIds = filter.rarity;
+    if (filter.nation) params.nat = filter.nation;
+    if (filter.league) params.leag = filter.league;
+    if (filter.club) params.team = filter.club;
+
+    return params;
+  }
+
+  private isSnipe(item: any, filter: any): boolean {
+    const buyNowPrice = item.buyNowPrice;
+    
+    // Check if price is within filter limits
+    if (buyNowPrice > filter.max_buy) return false;
+    if (filter.min_buy && buyNowPrice < filter.min_buy) return false;
+
+    // Check if profitable (if sell price specified)
+    if (filter.sell_price) {
+      const profit = filter.sell_price - buyNowPrice;
+      const profitPercent = (profit / buyNowPrice) * 100;
+      
+      if (profitPercent < config.trading.minProfitMargin) {
+        return false;
       }
     }
 
     return true;
   }
 
-  // ==========================================
-  // PURCHASE LOGIC
-  // ==========================================
+  private async attemptPurchase(accountId: string, item: any, filter: any): Promise<void> {
+    const session = this.sessions.get(accountId);
+    if (!session) return;
 
-  private async attemptPurchase(
-    api: EAAPI,
-    item: AuctionItem,
-    filter: SniperFilter,
-    session: SniperSession
-  ): Promise<SnipeResult> {
+    const api = await EAAPIFactory.getInstance(accountId);
+    if (!api) return;
+
+    // Check Anti-Ban for purchase
+    const decision = await antiBanService.shouldProceed(accountId, 'buy');
+    if (decision.action !== AntiBanAction.PROCEED && decision.action !== AntiBanAction.DELAY) {
+      logger.warn(`[${accountId}] Purchase blocked by Anti-Ban: ${decision.reason}`);
+      return;
+    }
+
+    if (decision.delayMs) {
+      await this.delay(decision.delayMs);
+    }
+
     try {
-      // Attempt to buy
-      const response = await api.buyNow(item.tradeId, item.buyNowPrice);
+      const success = await api.buyNow(item.tradeId, item.buyNowPrice);
 
-      // Check if purchase was successful
-      const purchasedItem = response.auctionInfo.find(
-        a => a.tradeId === item.tradeId && a.bidState === 'highest'
-      );
-
-      if (purchasedItem) {
+      if (success) {
         session.stats.purchases++;
-        session.stats.spent += item.buyNowPrice;
+        
+        // Record trade
+        await db.addTrade({
+          ea_account_id: accountId,
+          player_id: item.assetId || item.resourceId,
+          player_name: EAAPI.getPlayerName(item),
+          buy_price: item.buyNowPrice,
+          sell_price: null,
+          profit: null,
+          status: 'bought'
+        });
 
-        // Calculate sell price
-        let sellPrice = filter.sell_price;
-        if (!sellPrice) {
-          sellPrice = EAAPI.calculateSellPrice(
-            item.buyNowPrice, 
-            config.trading.minProfitMargin / 100
-          );
-        }
-
-        const profit = sellPrice - item.buyNowPrice - Math.floor(sellPrice * 0.05);
-
-        return {
-          success: true,
-          item: purchasedItem,
+        logger.info(`[${accountId}] ✅ Bought ${EAAPI.getPlayerName(item)} for ${item.buyNowPrice}`);
+        
+        this.emit('item_purchased', {
+          accountId,
+          item,
           buyPrice: item.buyNowPrice,
-          sellPrice,
-          profit
-        };
+          sellPrice: filter.sell_price
+        });
+
+        // List for sale if sell price specified
+        if (filter.sell_price) {
+          await this.listForSale(accountId, item, filter.sell_price);
+        }
       }
-
-      return { success: false, error: 'PURCHASE_FAILED' };
-
     } catch (error: any) {
-      logger.warn(`Purchase failed for item ${item.tradeId}:`, error.message);
+      logger.error(`[${accountId}] Purchase failed:`, error);
       
-      return { 
-        success: false, 
-        error: error.message 
-      };
+      if (error.response?.status) {
+        antiBanService.recordError(accountId, error.response.status);
+      }
     }
   }
 
-  // ==========================================
-  // LISTING LOGIC
-  // ==========================================
+  private async listForSale(accountId: string, item: any, sellPrice: number): Promise<void> {
+    const api = await EAAPIFactory.getInstance(accountId);
+    if (!api) return;
 
-  private async listItem(
-    api: EAAPI,
-    item: AuctionItem,
-    sellPrice: number,
-    session: SniperSession
-  ): Promise<void> {
+    // Small delay before listing
+    await this.delay(this.randomDelay(1000, 2000));
+
     try {
-      // First, move to tradepile
-      await api.sendToTradepile(item.itemData.id);
+      // First send to tradepile
+      await api.sendToTradepile(item.id);
       
-      // Wait a bit
-      await new Promise(resolve => setTimeout(resolve, 500));
-
-      // Calculate start price (90% of BIN)
-      const startPrice = EAAPI.roundToValidPrice(Math.floor(sellPrice * 0.9));
+      // Small delay
+      await this.delay(this.randomDelay(500, 1000));
 
       // List item
-      await api.listItem(item.itemData.id, startPrice, sellPrice, 3600);
-      
-      session.stats.listings++;
-      
-      logger.info(`Listed ${EAAPI.getPlayerName(item)} for ${sellPrice} coins`);
+      const listed = await api.listItem(item.id, sellPrice, sellPrice);
 
-    } catch (error) {
-      logger.error(`Failed to list item:`, error);
-    }
-  }
-
-  // ==========================================
-  // TRADEPILE MANAGEMENT
-  // ==========================================
-
-  private async manageTradepile(
-    accountId: string,
-    api: EAAPI,
-    session: SniperSession
-  ): Promise<void> {
-    try {
-      const tradepile = await api.getTradepile();
-
-      // Process sold items
-      const soldItems = tradepile.auctionInfo.filter(
-        item => item.tradeState === 'closed'
-      );
-
-      for (const item of soldItems) {
-        // Calculate profit
-        const sellPrice = item.currentBid;
-        session.stats.profit += sellPrice;
-
-        // Update transaction in database
-        // Note: This is simplified, you'd want to match by trade ID
+      if (listed) {
+        logger.info(`[${accountId}] Listed ${EAAPI.getPlayerName(item)} for ${sellPrice}`);
         
-        this.emit('item_sold', {
+        this.emit('item_listed', {
           accountId,
           item,
           sellPrice
         });
       }
-
-      // Remove sold items
-      if (soldItems.length > 0) {
-        await api.removeSold();
-      }
-
-      // Relist expired items
-      const expiredItems = tradepile.auctionInfo.filter(
-        item => item.tradeState === 'expired'
-      );
-
-      if (expiredItems.length > 0) {
-        await api.relistAll();
-        logger.info(`Relisted ${expiredItems.length} expired items`);
-      }
-
-      // Check tradepile space
-      const activeListings = tradepile.auctionInfo.filter(
-        item => item.tradeState === 'active'
-      ).length;
-
-      if (activeListings >= 95) {
-        logger.warn('Tradepile almost full, pausing purchases');
-        session.status = 'paused';
-      }
-
     } catch (error) {
-      logger.error('Tradepile management error:', error);
+      logger.error(`[${accountId}] Failed to list item:`, error);
     }
   }
 
   // ==========================================
-  // TRANSACTION RECORDING
+  // UTILITY METHODS
   // ==========================================
 
-  private async recordPurchase(
-    session: SniperSession,
-    filter: SniperFilter,
-    item: AuctionItem,
-    result: SnipeResult
-  ): Promise<void> {
-    try {
-      await db.recordTransaction({
-  user_id: session.userId,
-  ea_account_id: session.accountId,
-  filter_id: filter.id,
-  player_id: item.itemData.assetId,
-  player_name: EAAPI.getPlayerName(item),
-  buy_price: result.buyPrice!,
-  sell_price: result.sellPrice || null,
-  profit: null,
-  status: 'bought',
-  trade_id: String(item.tradeId),
-  sold_at: null
-});
-    } catch (error) {
-      logger.error('Failed to record transaction:', error);
-    }
+  private delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  // ==========================================
-  // ERROR HANDLING
-  // ==========================================
-
-  private async handleError(
-    accountId: string,
-    session: SniperSession,
-    error: any
-  ): Promise<void> {
-    const errorMessage = error.message || String(error);
-    
-    logger.error(`Sniper error for ${accountId}:`, errorMessage);
-
-    switch (errorMessage) {
-      case 'SESSION_EXPIRED':
-        session.status = 'error';
-        session.error = 'Сесія закінчилась. Оновіть cookies.';
-        this.emit('session_expired', { accountId });
-        await this.stopSession(accountId);
-        break;
-
-      case 'CAPTCHA_REQUIRED':
-        session.status = 'paused';
-        session.error = 'Потрібна капча!';
-        this.emit('captcha_required', { accountId });
-        break;
-
-      case 'RATE_LIMITED':
-        session.status = 'paused';
-        logger.warn('Rate limited, pausing for 5 minutes');
-        setTimeout(() => this.resumeSession(accountId), 300000);
-        break;
-
-      case 'TRANSFER_MARKET_LOCKED':
-        session.status = 'error';
-        session.error = 'Трансферний ринок заблоковано!';
-        this.emit('market_locked', { accountId });
-        await this.stopSession(accountId);
-        break;
-
-      default:
-        // For unknown errors, pause briefly and continue
-        session.status = 'paused';
-        setTimeout(() => this.resumeSession(accountId), 30000);
-    }
-  }
-
-  // ==========================================
-  // FILTER MANAGEMENT
-  // ==========================================
-
-  async addFilter(accountId: string, filter: SniperFilter): Promise<void> {
-    const session = this.sessions.get(accountId);
-    if (session) {
-      session.filters.push(filter);
-    }
-  }
-
-  async removeFilter(accountId: string, filterId: string): Promise<void> {
-    const session = this.sessions.get(accountId);
-    if (session) {
-      session.filters = session.filters.filter(f => f.id !== filterId);
-    }
-  }
-
-  async reloadFilters(accountId: string): Promise<void> {
-    const session = this.sessions.get(accountId);
-    if (session) {
-      session.filters = await db.getActiveFilters(accountId);
-      logger.info(`Reloaded ${session.filters.length} filters for ${accountId}`);
-    }
+  private randomDelay(min: number, max: number): number {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
   }
 }
 
-// Export singleton instance
+// Export singleton
 export const sniperEngine = new SniperEngine();

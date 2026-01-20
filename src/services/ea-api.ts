@@ -1,19 +1,26 @@
+/**
+ * FC26 EA API Service - Updated with Anti-Ban Integration
+ * 
+ * Complete rewrite incorporating:
+ * - Anti-Ban system integration
+ * - New authentication flow
+ * - Captcha handling
+ * - Session management
+ */
+
 import axios, { AxiosInstance, AxiosResponse } from 'axios';
 import { Cookie, CookieJar } from 'tough-cookie';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 import { db, EAAccount } from '../database';
+import { antiBanService, AntiBanAction, AntiBanDecision } from './anti-ban';
+import { captchaSolver, eaCaptchaHandler } from './captcha-solver';
+import { eaAuthManager, EASession, AuthCookies } from './ea-auth';
+import { EventEmitter } from 'events';
 
 // ==========================================
 // EA API TYPES
 // ==========================================
-export interface EASession {
-  personaId: string;
-  nucleusId: string;
-  sessionId: string;
-  phishingToken: string;
-  dob: string;
-}
 
 export interface SearchFilter {
   type?: 'player' | 'training' | 'development' | 'playStyle';
@@ -77,35 +84,46 @@ export interface BuyResponse {
   currencies: Array<{ finalFunds: number; funds: number; name: string }>;
 }
 
-// ==========================================
-// EA API SERVICE
-// ==========================================
-export class EAAPI {
-  private client: AxiosInstance;
-  private cookieJar: CookieJar;
-  private session: EASession | null = null;
-  private accountId: string;
-  public platform: string;
-  private baseUrl: string;
+// Error codes for special handling
+const EA_ERROR_CODES = {
+  SESSION_EXPIRED: 401,
+  FORBIDDEN: 403,
+  CONFLICT: 409,
+  CAPTCHA_REQUIRED: 426,
+  RATE_LIMITED: 429,
+  TRANSFER_LOCKED: 458,
+  ITEM_NOT_FOUND: 460,
+  PERMISSION_DENIED: 461,
+  NO_TRADE: 478,
+  MARKET_LOCKED: 512,
+};
 
-  // Request tracking
-  private requestCount: number = 0;
-  private hourStart: number = Date.now();
-  private lastRequestTime: number = 0;
+// Platform URLs
+const PLATFORM_URLS: Record<string, string> = {
+  'ps': 'https://utas.mob.v1.fut.ea.com',
+  'xbox': 'https://utas.mob.v2.fut.ea.com',
+  'pc': 'https://utas.mob.v4.fut.ea.com'
+};
+
+// ==========================================
+// EA API CLASS
+// ==========================================
+
+export class EAAPI extends EventEmitter {
+  private client: AxiosInstance;
+  private accountId: string;
+  private platform: 'ps' | 'xbox' | 'pc';
+  private baseUrl: string;
+  private session: EASession | null = null;
+  
+  // Coin tracking
+  public coins: number = 0;
 
   constructor(accountId: string, platform: 'ps' | 'xbox' | 'pc') {
+    super();
     this.accountId = accountId;
     this.platform = platform;
-    this.cookieJar = new CookieJar();
-
-    // Platform-specific URLs - ОНОВЛЕНО для FC 26
-    const platformUrls: Record<string, string> = {
-      'ps': 'https://utas.mob.v1.fut.ea.com',
-      'xbox': 'https://utas.mob.v2.fut.ea.com',
-      'pc': 'https://utas.mob.v4.fut.ea.com'
-    };
-
-    this.baseUrl = platformUrls[platform] || platformUrls['ps'];
+    this.baseUrl = PLATFORM_URLS[platform];
 
     this.client = axios.create({
       baseURL: this.baseUrl,
@@ -127,143 +145,88 @@ export class EAAPI {
       }
     });
 
-    // Add response interceptor for error handling
-    this.client.interceptors.response.use(
-      (response) => response,
-      (error) => this.handleError(error)
-    );
+    // Initialize Anti-Ban session
+    antiBanService.initSession(accountId);
   }
 
   // ==========================================
   // SESSION MANAGEMENT
   // ==========================================
+
+  /**
+   * Initialize from stored cookies/session
+   */
   async initFromCookies(cookies: Record<string, string>): Promise<boolean> {
     try {
-      // Set cookies to jar
-      for (const [name, value] of Object.entries(cookies)) {
-        const cookie = new Cookie({
-          key: name,
-          value: value,
-          domain: '.ea.com',
-          path: '/'
-        });
-        await this.cookieJar.setCookie(cookie, 'https://ea.com');
+      const sid = cookies.sid || cookies['X-UT-SID'] || cookies.sessionId;
+      
+      if (!sid) {
+        logger.error(`[EAAPI] No SID found in cookies`);
+        return false;
       }
 
-      // Extract session data from cookies
       this.session = {
-        personaId: cookies['personaId'] || '',
-        nucleusId: cookies['nucleusId'] || '',
-        sessionId: cookies['sid'] || cookies['sessionId'] || '',
-        phishingToken: cookies['phishing'] || cookies['phishingToken'] || '',
-        dob: cookies['dob'] || ''
+        sid,
+        platform: this.platform,
       };
 
-      // Log session info for debugging
-      logger.info(`Session initialized: SID=${this.session.sessionId.substring(0, 8)}...`);
-
-      // Verify session is valid
+      // Verify session
       const isValid = await this.verifySession();
 
       if (isValid) {
-        logger.info(`EA Session verified for account ${this.accountId}`);
-      } else {
-        logger.warn(`EA Session verification failed for account ${this.accountId}`);
+        logger.info(`[EAAPI] Session verified for ${this.accountId}`);
+        return true;
       }
 
-      return isValid;
+      logger.warn(`[EAAPI] Session invalid for ${this.accountId}`);
+      return false;
+
     } catch (error) {
-      logger.error('Failed to init from cookies:', error);
+      logger.error('[EAAPI] Init from cookies failed:', error);
       return false;
     }
   }
 
+  /**
+   * Set session directly
+   */
+  setSession(session: EASession): void {
+    this.session = session;
+  }
+
+  /**
+   * Verify current session is valid
+   */
   async verifySession(): Promise<boolean> {
     try {
       const response = await this.getCredits();
-      logger.info(`Session verified, credits: ${response.credits}`);
       return response.credits !== undefined;
-    } catch (error: any) {
-      logger.error(`Session verification error: ${error.message}`);
+    } catch (error) {
       return false;
     }
   }
 
   // ==========================================
-  // RATE LIMITING
+  // ANTI-BAN PROTECTED REQUEST
   // ==========================================
-  private async checkRateLimit(): Promise<void> {
-    const now = Date.now();
-
-    // Reset hourly counter
-    if (now - this.hourStart > 3600000) {
-      this.hourStart = now;
-      this.requestCount = 0;
-    }
-
-    // Check if we're over limit
-    if (this.requestCount >= config.trading.maxRequestsPerHour) {
-      const waitTime = 3600000 - (now - this.hourStart);
-      throw new Error(`Rate limit exceeded. Wait ${Math.ceil(waitTime / 60000)} minutes.`);
-    }
-
-    // Minimum delay between requests
-    const timeSinceLastRequest = now - this.lastRequestTime;
-    const minDelay = config.trading.minSearchDelay;
-
-    if (timeSinceLastRequest < minDelay) {
-      await this.delay(minDelay - timeSinceLastRequest);
-    }
-
-    this.requestCount++;
-    this.lastRequestTime = Date.now();
-  }
-
-  private delay(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  private randomDelay(): Promise<void> {
-    const delay = Math.floor(
-      Math.random() * (config.trading.maxSearchDelay - config.trading.minSearchDelay) +
-      config.trading.minSearchDelay
-    );
-    return this.delay(delay);
-  }
-
-  // ==========================================
-  // REQUEST HELPERS - ВИПРАВЛЕНО!
-  // ==========================================
-  private getHeaders(): Record<string, string> {
-    if (!this.session) {
-      throw new Error('Session not initialized');
-    }
-
-    // ✅ ВИПРАВЛЕННЯ: Тільки обов'язкові headers
-    const headers: Record<string, string> = {
-      'X-UT-SID': this.session.sessionId
-    };
-
-    // Додаємо phishing token ТІЛЬКИ якщо він є
-    if (this.session.phishingToken && this.session.phishingToken.length > 0) {
-      headers['X-UT-PHISHING-TOKEN'] = this.session.phishingToken;
-    }
-
-    return headers;
-  }
 
   private async request<T>(
     method: 'GET' | 'POST' | 'PUT' | 'DELETE',
     endpoint: string,
+    requestType: 'search' | 'buy' | 'action',
     data?: object
   ): Promise<T> {
-    await this.checkRateLimit();
+    // Check Anti-Ban decision
+    const decision = await antiBanService.shouldProceed(this.accountId, requestType);
+    
+    await this.handleAntiBanDecision(decision);
 
     const url = `/ut/game/fc26${endpoint}`;
 
-    logger.debug(`EA API Request: ${method} ${url}`);
-
     try {
+      // Log request (debug mode)
+      logger.debug(`[EAAPI] ${method} ${url}`);
+
       const response: AxiosResponse<T> = await this.client.request({
         method,
         url,
@@ -271,50 +234,122 @@ export class EAAPI {
         headers: this.getHeaders()
       });
 
+      // Record successful request
+      antiBanService.recordRequest(this.accountId, requestType);
+
       return response.data;
+
     } catch (error: any) {
-      // Log more details for debugging
-      if (error.response) {
-        logger.error(`EA API Error: ${error.response.status} - ${JSON.stringify(error.response.data)}`);
-      }
-      throw this.handleError(error);
+      return this.handleRequestError(error, requestType);
     }
   }
 
-  private handleError(error: any): Error {
-    if (error.response) {
-      const status = error.response.status;
-      const data = error.response.data;
+  /**
+   * Handle Anti-Ban decision
+   */
+  private async handleAntiBanDecision(decision: AntiBanDecision): Promise<void> {
+    switch (decision.action) {
+      case AntiBanAction.STOP:
+        logger.error(`[EAAPI] Anti-Ban STOP: ${decision.reason}`);
+        this.emit('anti_ban_stop', { reason: decision.reason, stats: decision.stats });
+        throw new Error(`ANTI_BAN_STOP: ${decision.reason}`);
 
-      logger.error(`EA API Error Response: ${status}`, data);
+      case AntiBanAction.PAUSE:
+        logger.warn(`[EAAPI] Anti-Ban PAUSE: ${decision.reason} (${decision.pauseMs}ms)`);
+        this.emit('anti_ban_pause', { 
+          reason: decision.reason, 
+          duration: decision.pauseMs 
+        });
+        await this.delay(decision.pauseMs!);
+        break;
 
+      case AntiBanAction.DELAY:
+        if (decision.delayMs && decision.delayMs > 0) {
+          logger.debug(`[EAAPI] Anti-Ban DELAY: ${decision.delayMs}ms`);
+          await this.delay(decision.delayMs);
+        }
+        break;
+
+      case AntiBanAction.PROCEED:
+        // Continue normally
+        break;
+    }
+  }
+
+  /**
+   * Handle request errors with Anti-Ban integration
+   */
+  private handleRequestError(error: any, requestType: string): never {
+    const status = error.response?.status;
+    const data = error.response?.data;
+
+    logger.error(`[EAAPI] Request error: ${status}`, data);
+
+    // Record error in Anti-Ban system
+    if (status) {
+      const decision = antiBanService.recordError(this.accountId, status);
+      
+      // Emit error events based on type
       switch (status) {
-        case 401:
-          return new Error('SESSION_EXPIRED');
-        case 403:
-          return new Error('FORBIDDEN');
-        case 409:
-          return new Error('CONFLICT');
-        case 426:
-          return new Error('CAPTCHA_REQUIRED');
-        case 429:
-          return new Error('RATE_LIMITED');
-        case 458:
-          return new Error('TRANSFER_MARKET_LOCKED');
-        case 460:
-          return new Error('ITEM_NOT_FOUND');
-        case 461:
-          return new Error('PERMISSION_DENIED');
-        case 478:
-          return new Error('NO_TRADE_EXISTS');
-        case 512:
-          return new Error('MARKET_LOCKED');
-        default:
-          return new Error(`EA_ERROR_${status}: ${JSON.stringify(data)}`);
+        case EA_ERROR_CODES.SESSION_EXPIRED:
+          this.emit('session_expired', { accountId: this.accountId });
+          break;
+        case EA_ERROR_CODES.CAPTCHA_REQUIRED:
+          this.emit('captcha_required', { accountId: this.accountId });
+          break;
+        case EA_ERROR_CODES.RATE_LIMITED:
+          this.emit('rate_limited', { accountId: this.accountId });
+          break;
+        case EA_ERROR_CODES.TRANSFER_LOCKED:
+          this.emit('transfer_locked', { accountId: this.accountId });
+          break;
+        case EA_ERROR_CODES.MARKET_LOCKED:
+          this.emit('market_locked', { accountId: this.accountId });
+          break;
+      }
+
+      // If Anti-Ban says stop, throw appropriate error
+      if (decision.action === AntiBanAction.STOP) {
+        throw new Error(`CRITICAL_ERROR_${status}`);
       }
     }
 
-    return error;
+    // Throw descriptive error
+    const errorCode = this.getErrorCode(status);
+    throw new Error(errorCode);
+  }
+
+  /**
+   * Get error code string
+   */
+  private getErrorCode(status: number): string {
+    switch (status) {
+      case 401: return 'SESSION_EXPIRED';
+      case 403: return 'FORBIDDEN';
+      case 409: return 'CONFLICT';
+      case 426: return 'CAPTCHA_REQUIRED';
+      case 429: return 'RATE_LIMITED';
+      case 458: return 'TRANSFER_LOCKED';
+      case 460: return 'ITEM_NOT_FOUND';
+      case 461: return 'PERMISSION_DENIED';
+      case 478: return 'NO_TRADE_EXISTS';
+      case 512: return 'MARKET_LOCKED';
+      default: return `EA_ERROR_${status}`;
+    }
+  }
+
+  // ==========================================
+  // HEADERS
+  // ==========================================
+
+  private getHeaders(): Record<string, string> {
+    if (!this.session?.sid) {
+      throw new Error('No session - call initFromCookies first');
+    }
+
+    return {
+      'X-UT-SID': this.session.sid,
+    };
   }
 
   // ==========================================
@@ -324,40 +359,27 @@ export class EAAPI {
   /**
    * Get current coins balance
    */
-async getCredits(): Promise<{ credits: number }> {
-  const response = await this.request<any>('GET', '/user/credits');
+  async getCredits(): Promise<{ credits: number }> {
+    const response = await this.request<any>('GET', '/user/credits', 'action');
 
-  // EA може повертати в різних форматах
-  let credits = 0;
-
-  if (typeof response === 'object') {
-    // Формат: { credits: 123 }
+    let credits = 0;
     if (response.credits !== undefined) {
       credits = response.credits;
-    }
-    // Формат: { userInfo: { credits: 123 } }
-    else if (response.userInfo?.credits !== undefined) {
+    } else if (response.userInfo?.credits !== undefined) {
       credits = response.userInfo.credits;
-    }
-    // Формат: { currencies: [{ name: 'COINS', funds: 123 }] }
-    else if (response.currencies) {
+    } else if (response.currencies) {
       const coins = response.currencies.find((c: any) => c.name === 'COINS');
       if (coins) credits = coins.funds;
     }
+
+    this.coins = credits;
+    return { credits };
   }
-
-  logger.info(`Credits response: ${JSON.stringify(response).substring(0, 200)}`);
-  logger.info(`Parsed credits: ${credits}`);
-
-  return { credits };
-}
 
   /**
    * Search transfer market
    */
   async search(filter: SearchFilter): Promise<SearchResponse> {
-    await this.randomDelay();
-
     const params = new URLSearchParams();
 
     params.append('start', String(filter.start || 0));
@@ -377,29 +399,21 @@ async getCredits(): Promise<{ credits: number }> {
     if (filter.minBid) params.append('micr', String(filter.minBid));
     if (filter.maxBid) params.append('macr', String(filter.maxBid));
 
-    return this.request<SearchResponse>('GET', `/transfermarket?${params.toString()}`);
+    return this.request<SearchResponse>('GET', `/transfermarket?${params.toString()}`, 'search');
   }
 
   /**
    * Buy item instantly (BIN)
    */
   async buyNow(tradeId: number, price: number): Promise<BuyResponse> {
-    const data = {
-      bid: price
-    };
-
-    return this.request<BuyResponse>('PUT', `/trade/${tradeId}/bid`, data);
+    return this.request<BuyResponse>('PUT', `/trade/${tradeId}/bid`, 'buy', { bid: price });
   }
 
   /**
    * Place a bid on item
    */
   async placeBid(tradeId: number, amount: number): Promise<BuyResponse> {
-    const data = {
-      bid: amount
-    };
-
-    return this.request<BuyResponse>('PUT', `/trade/${tradeId}/bid`, data);
+    return this.request<BuyResponse>('PUT', `/trade/${tradeId}/bid`, 'buy', { bid: amount });
   }
 
   /**
@@ -411,105 +425,77 @@ async getCredits(): Promise<{ credits: number }> {
     buyNowPrice: number,
     duration: number = 3600
   ): Promise<{ id: number }> {
-    const data = {
-      itemData: {
-        id: itemId
-      },
+    return this.request<{ id: number }>('POST', '/auctionhouse', 'action', {
+      itemData: { id: itemId },
       startingBid: startPrice,
-      duration: duration,
-      buyNowPrice: buyNowPrice
-    };
-
-    return this.request<{ id: number }>('POST', '/auctionhouse', data);
+      duration,
+      buyNowPrice
+    });
   }
 
   /**
-   * Get tradepile (items for sale)
+   * Get tradepile
    */
   async getTradepile(): Promise<{ auctionInfo: AuctionItem[] }> {
-    return this.request<{ auctionInfo: AuctionItem[] }>('GET', '/tradepile');
+    return this.request<{ auctionInfo: AuctionItem[] }>('GET', '/tradepile', 'action');
   }
 
   /**
    * Get watchlist
    */
   async getWatchlist(): Promise<{ auctionInfo: AuctionItem[] }> {
-    return this.request<{ auctionInfo: AuctionItem[] }>('GET', '/watchlist');
+    return this.request<{ auctionInfo: AuctionItem[] }>('GET', '/watchlist', 'action');
   }
 
   /**
    * Get unassigned items
    */
   async getUnassigned(): Promise<{ itemData: any[] }> {
-    return this.request<{ itemData: any[] }>('GET', '/purchased/items');
+    return this.request<{ itemData: any[] }>('GET', '/purchased/items', 'action');
   }
 
   /**
    * Send item to tradepile
    */
   async sendToTradepile(itemId: number): Promise<{ itemData: any[] }> {
-    const data = {
+    return this.request<{ itemData: any[] }>('PUT', '/item', 'action', {
       itemData: [{ id: itemId, pile: 'trade' }]
-    };
-
-    return this.request<{ itemData: any[] }>('PUT', '/item', data);
+    });
   }
 
   /**
    * Send item to club
    */
   async sendToClub(itemId: number): Promise<{ itemData: any[] }> {
-    const data = {
+    return this.request<{ itemData: any[] }>('PUT', '/item', 'action', {
       itemData: [{ id: itemId, pile: 'club' }]
-    };
-
-    return this.request<{ itemData: any[] }>('PUT', '/item', data);
+    });
   }
 
   /**
    * Quick sell item
    */
   async quickSell(itemId: number): Promise<{ credits: number }> {
-    return this.request<{ credits: number }>('DELETE', `/item/${itemId}`);
+    return this.request<{ credits: number }>('DELETE', `/item/${itemId}`, 'action');
   }
 
   /**
    * Relist all expired items
    */
   async relistAll(): Promise<{ tradeIdList: number[] }> {
-    return this.request<{ tradeIdList: number[] }>('PUT', '/auctionhouse/relist');
+    return this.request<{ tradeIdList: number[] }>('PUT', '/auctionhouse/relist', 'action');
   }
 
   /**
-   * Remove sold items from tradepile
+   * Remove sold items
    */
   async removeSold(): Promise<void> {
     const tradepile = await this.getTradepile();
     const soldItems = tradepile.auctionInfo.filter(item => item.tradeState === 'closed');
 
     for (const item of soldItems) {
-      await this.request('DELETE', `/trade/${item.tradeId}`);
+      await this.request<void>('DELETE', `/trade/${item.tradeId}`, 'action');
       await this.delay(200);
-    }
-  }
-
-  /**
-   * Get lowest BIN price for a player
-   */
-  async getLowestBIN(playerId: number): Promise<number | null> {
-    try {
-      const result = await this.search({
-        maskedDefId: playerId,
-        count: 21
-      });
-
-      if (result.auctionInfo.length === 0) return null;
-
-      const prices = result.auctionInfo.map(item => item.buyNowPrice);
-      return Math.min(...prices);
-    } catch (error) {
-      logger.error(`Failed to get lowest BIN for player ${playerId}:`, error);
-      return null;
     }
   }
 
@@ -524,16 +510,17 @@ async getCredits(): Promise<{ credits: number }> {
   // UTILITY METHODS
   // ==========================================
 
+  private delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
   /**
    * Calculate sell price with EA tax
    */
   static calculateSellPrice(buyPrice: number, profitMargin: number = 0.05): number {
-    // EA takes 5% tax, so we need to account for that
     const taxMultiplier = 0.95;
     const targetProfit = buyPrice * profitMargin;
     const sellPrice = Math.ceil((buyPrice + targetProfit) / taxMultiplier);
-
-    // Round to valid price
     return EAAPI.roundToValidPrice(sellPrice);
   }
 
@@ -556,42 +543,52 @@ async getCredits(): Promise<{ credits: number }> {
     return `${firstName} ${lastName}`.trim() || 'Unknown Player';
   }
 
-  getRequestCount(): number {
-    return this.requestCount;
+  /**
+   * Get Anti-Ban status
+   */
+  getAntiBanStatus(): string {
+    return antiBanService.getStatus(this.accountId);
   }
 
-  getRemainingRequests(): number {
-    return config.trading.maxRequestsPerHour - this.requestCount;
+  /**
+   * Get risk percentage
+   */
+  getRiskPercentage(): number {
+    return antiBanService.getRiskPercentage(this.accountId);
   }
 }
 
 // ==========================================
 // EA API FACTORY
 // ==========================================
+
 export class EAAPIFactory {
   private static instances: Map<string, EAAPI> = new Map();
 
+  /**
+   * Get or create API instance for account
+   */
   static async getInstance(accountId: string): Promise<EAAPI | null> {
-    // Return existing instance if available
+    // Return existing
     if (this.instances.has(accountId)) {
       return this.instances.get(accountId)!;
     }
 
-    // Load account from database
+    // Load from database
     const accountData = await db.getEAAccountWithCookies(accountId);
     if (!accountData) {
-      logger.error(`Account ${accountId} not found`);
+      logger.error(`[EAAPIFactory] Account ${accountId} not found`);
       return null;
     }
 
     const { account, cookies } = accountData;
 
-    // Create new API instance
+    // Create new instance
     const api = new EAAPI(accountId, account.platform);
     const initialized = await api.initFromCookies(cookies as Record<string, string>);
 
     if (!initialized) {
-      logger.error(`Failed to initialize EA API for account ${accountId}`);
+      logger.error(`[EAAPIFactory] Failed to initialize API for ${accountId}`);
       return null;
     }
 
@@ -599,11 +596,31 @@ export class EAAPIFactory {
     return api;
   }
 
+  /**
+   * Remove instance
+   */
   static removeInstance(accountId: string): void {
-    this.instances.delete(accountId);
+    const api = this.instances.get(accountId);
+    if (api) {
+      antiBanService.removeSession(accountId);
+      this.instances.delete(accountId);
+    }
   }
 
+  /**
+   * Clear all instances
+   */
   static clearAll(): void {
+    for (const [accountId] of this.instances) {
+      antiBanService.removeSession(accountId);
+    }
     this.instances.clear();
+  }
+
+  /**
+   * Get all active instances
+   */
+  static getActiveInstances(): string[] {
+    return Array.from(this.instances.keys());
   }
 }
