@@ -399,18 +399,40 @@ export class EAAuth extends EventEmitter {
     try {
       logger.info('[EAAuth] Requesting verification code to be sent...');
 
-      // Check if we need to select a method first (email vs app)
-      // Look for "Send code" or method selection buttons
-      const needsMethodSelection = html.includes('codeType') ||
-                                    html.includes('EMAIL_') ||
-                                    html.includes('send') && html.includes('code');
+      // On s3 page, we need to click "SEND CODE" button
+      // This is done by POSTing with _eventId=sendCode
+      const sendResponse = await this.client.post(tfaUrl, new URLSearchParams({
+        _eventId: 'sendCode'
+      }).toString(), {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Origin': 'https://signin.ea.com',
+          'Referer': tfaUrl
+        },
+        maxRedirects: 5,
+        validateStatus: () => true
+      });
 
-      if (needsMethodSelection) {
-        logger.info('[EAAuth] Selecting email verification method...');
+      const newUrl = sendResponse.request?.res?.responseUrl || tfaUrl;
+      const newHtml = typeof sendResponse.data === 'string' ? sendResponse.data : '';
 
-        // Try to submit with email method selected
-        const sendResponse = await this.client.post(tfaUrl, new URLSearchParams({
-          codeType: 'EMAIL',
+      // Check if we advanced to code input page (s4)
+      const newExecMatch = newUrl.match(/execution=e\d+s(\d+)/);
+      const newStep = newExecMatch ? parseInt(newExecMatch[1]) : 0;
+
+      logger.info(`[EAAuth] After sendCode: step=${newStep}, url=${newUrl.substring(0, 60)}`);
+
+      if (newStep >= 4 || newHtml.includes('Enter your code') || newHtml.includes('Enter 6 digit')) {
+        logger.info('[EAAuth] ✅ Code sent! Now on code input page (s4)');
+        return { newUrl };
+      }
+
+      // Maybe need different event
+      if (newStep === 3) {
+        logger.warn('[EAAuth] Still on s3 after sendCode, trying alternative...');
+
+        // Try with submit
+        const retry = await this.client.post(tfaUrl, new URLSearchParams({
           _eventId: 'submit'
         }).toString(), {
           headers: {
@@ -422,39 +444,13 @@ export class EAAuth extends EventEmitter {
           validateStatus: () => true
         });
 
-        const newUrl = sendResponse.request?.res?.responseUrl || tfaUrl;
-        const newHtml = typeof sendResponse.data === 'string' ? sendResponse.data : '';
-
-        // Check if we advanced to code input page
-        const newExecMatch = newUrl.match(/execution=e\d+s(\d+)/);
-        const newStep = newExecMatch ? parseInt(newExecMatch[1]) : 0;
-
-        if (newStep > 3 || newHtml.includes('twoFactorCode') || newHtml.includes('Enter the code')) {
-          logger.info('[EAAuth] ✅ Code send request successful, now on code input page');
-          return { newUrl };
+        const retryUrl = retry.request?.res?.responseUrl;
+        if (retryUrl && retryUrl !== tfaUrl) {
+          return { newUrl: retryUrl };
         }
       }
 
-      // Try alternative: just submit the form to trigger code send
-      const sendResponse = await this.client.post(tfaUrl, new URLSearchParams({
-        _eventId: 'submit'
-      }).toString(), {
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Origin': 'https://signin.ea.com',
-          'Referer': tfaUrl
-        },
-        maxRedirects: 5,
-        validateStatus: () => true
-      });
-
-      const newUrl = sendResponse.request?.res?.responseUrl;
-      if (newUrl && newUrl !== tfaUrl) {
-        logger.info('[EAAuth] Form submitted, new URL received');
-        return { newUrl };
-      }
-
-      return {};
+      return { newUrl };
 
     } catch (error: any) {
       logger.warn('[EAAuth] Failed to request code send:', error.message);
@@ -470,30 +466,40 @@ export class EAAuth extends EventEmitter {
     try {
       logger.info('[EAAuth] Step 3: Submitting 2FA code...');
 
+      // Field name is "verification" (found via browser inspection)
       const response = await this.client.post(tfaUrl, new URLSearchParams({
-        twoFactorCode: code,
+        verification: code,
         _eventId: 'submit',
-        _trustThisDevice: 'on'
+        _trustThisDevice: 'on',
+        trustThisDevice: 'on'
       }).toString(), {
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
           'Origin': 'https://signin.ea.com',
           'Referer': tfaUrl
         },
-        maxRedirects: 5
+        maxRedirects: 10
       });
 
       const finalUrl = response.request?.res?.responseUrl || '';
       const location = response.headers?.location || '';
       const html = typeof response.data === 'string' ? response.data : '';
 
+      logger.info(`[EAAuth] After 2FA submit: url=${finalUrl.substring(0, 80)}`);
+
       if (finalUrl.includes('access_token=') || location.includes('access_token=')) {
-        logger.info('[EAAuth] 2FA success');
+        logger.info('[EAAuth] ✅ 2FA success - got access token!');
         return { success: true };
       }
 
-      if (html.includes('incorrect') || html.includes('invalid') || html.includes('wrong')) {
-        return { success: false, error: 'Невірний 2FA код' };
+      if (html.includes('incorrect') || html.includes('invalid') || html.includes('wrong') || html.includes('expired')) {
+        return { success: false, error: 'Невірний або застарілий 2FA код' };
+      }
+
+      // Check if we got redirected to auth.html (success)
+      if (finalUrl.includes('auth.html')) {
+        logger.info('[EAAuth] ✅ 2FA success - redirected to auth.html');
+        return { success: true };
       }
 
       return { success: true };
