@@ -730,6 +730,15 @@ export class TelegramBot {
         try {
           const cookies = JSON.parse(text);
           
+          if (!cookies.sid || !cookies.personaId || !cookies.nucleusId) {
+            await ctx.reply(
+              '❌ Невірний формат! Потрібні поля: sid, personaId, nucleusId\n\n' +
+              'Приклад:\n' +
+              '{"sid":"xxx","personaId":"xxx","nucleusId":"xxx"}'
+            );
+            return;
+          }
+
           const account = await db.addEAAccount(
             ctx.user!.id,
             state.data.email,
@@ -738,81 +747,121 @@ export class TelegramBot {
           );
 
           this.userStates.delete(ctx.from!.id);
-          
+
           await ctx.reply(
-            `✅ *Акаунт додано!*\n\n` +
-            `📧 ${state.data.email}\n` +
-            `🎮 ${state.data.platform.toUpperCase()}\n\n` +
-            `Тепер створіть фільтр: /add_filter`,
-            { parse_mode: 'Markdown' }
+            `✅ Акаунт додано!\n\n` +
+            `📧 Email: ${state.data.email}\n` +
+            `🎮 Платформа: ${state.data.platform.toUpperCase()}\n\n` +
+            `Наступний крок - створіть фільтр:\n` +
+            `/add_filter`
           );
         } catch (error) {
-          await ctx.reply('❌ Невірний формат JSON. Спробуйте ще раз:');
+          await ctx.reply(
+            '❌ Невірний формат JSON!\n\n' +
+            'Надішліть у форматі:\n' +
+            '{"sid":"ваш_sid","personaId":"ваш_id","nucleusId":"ваш_nucleus"}'
+          );
         }
         break;
 
       case 'update_cookies':
         try {
           const cookies = JSON.parse(text);
-          
+
+          if (!cookies.sid || !cookies.personaId || !cookies.nucleusId) {
+            await ctx.reply(
+              '❌ Невірний формат! Потрібні поля: sid, personaId, nucleusId'
+            );
+            return;
+          }
+
           await db.updateEAAccountSession(state.data.accountId, { cookies });
-          
+
           this.userStates.delete(ctx.from!.id);
-          
-          await ctx.reply('✅ Cookies оновлено!');
+
+          await ctx.reply('✅ Cookies успішно оновлено!');
         } catch (error) {
-          await ctx.reply('❌ Невірний формат JSON. Спробуйте ще раз:');
+          await ctx.reply(
+            '❌ Невірний формат JSON!\n\n' +
+            'Надішліть у форматі:\n' +
+            '{"sid":"ваш_sid","personaId":"ваш_id","nucleusId":"ваш_nucleus"}'
+          );
         }
         break;
 
       case 'add_filter_name':
         state.data.name = text;
         state.step = 'add_filter_max_buy';
-        await ctx.reply('💰 Введіть максимальну ціну покупки:');
+        await ctx.reply(
+          '💰 Введіть максимальну ціну покупки (в монетах):\n\n' +
+          'Приклад: 10000'
+        );
         break;
 
       case 'add_filter_max_buy':
-        const maxBuy = parseInt(text);
+        const maxBuy = parseInt(text.replace(/\s/g, ''));
         if (isNaN(maxBuy) || maxBuy <= 0) {
-          await ctx.reply('❌ Введіть коректне число:');
+          await ctx.reply('❌ Введіть коректне число більше 0:');
           return;
         }
         state.data.maxBuy = maxBuy;
         state.step = 'add_filter_sell_price';
-        await ctx.reply('💵 Введіть ціну продажу (або "auto" для автоматичного розрахунку):');
+        await ctx.reply(
+          '💵 Введіть ціну продажу:\n\n' +
+          `• Введіть число (наприклад: ${Math.floor(maxBuy * 1.1)})\n` +
+          '• Або напишіть "auto" для авто-розрахунку (+10%)'
+        );
         break;
 
       case 'add_filter_sell_price':
-        const sellPrice = text.toLowerCase() === 'auto' ? null : parseInt(text);
-        
-        // Create filter
-        await db.addFilter({
-          user_id: ctx.user!.id,
-          ea_account_id: state.data.accountId,
-          name: state.data.name,
-          player_id: state.data.playerId || null,
-          min_buy: null,
-          max_buy: state.data.maxBuy,
-          sell_price: sellPrice,
-          position: null,
-          quality: null,
-          rarity: null,
-          nation: null,
-          league: null,
-          club: null,
-          is_active: true
-        });
+        const sellPrice = text.toLowerCase() === 'auto' ? null : parseInt(text.replace(/\s/g, ''));
 
-        this.userStates.delete(ctx.from!.id);
-        
-        await ctx.reply(
-          `✅ *Фільтр створено!*\n\n` +
-          `📝 ${state.data.name}\n` +
-          `💰 Max: ${state.data.maxBuy.toLocaleString()}\n` +
-          `💵 Sell: ${sellPrice?.toLocaleString() || 'Auto'}`,
-          { parse_mode: 'Markdown' }
-        );
+        if (sellPrice !== null && (isNaN(sellPrice) || sellPrice <= 0)) {
+          await ctx.reply('❌ Введіть коректне число або "auto":');
+          return;
+        }
+
+        try {
+          await db.addFilter({
+            user_id: ctx.user!.id,
+            ea_account_id: state.data.accountId,
+            name: state.data.name,
+            player_id: state.data.playerId || null,
+            min_buy: null,
+            max_buy: state.data.maxBuy,
+            sell_price: sellPrice,
+            position: null,
+            quality: null,
+            rarity: null,
+            nation: null,
+            league: null,
+            club: null,
+            is_active: true
+          });
+
+          this.userStates.delete(ctx.from!.id);
+
+          const profitInfo = sellPrice
+            ? `${(sellPrice - state.data.maxBuy).toLocaleString()} монет`
+            : 'авто-розрахунок';
+
+          await ctx.reply(
+            `✅ Фільтр створено!\n\n` +
+            `📝 Назва: ${state.data.name}\n` +
+            `💰 Макс. покупка: ${state.data.maxBuy.toLocaleString()}\n` +
+            `💵 Ціна продажу: ${sellPrice?.toLocaleString() || 'Auto'}\n` +
+            `📈 Прибуток: ${profitInfo}\n\n` +
+            `Запустіть снайпер: /start_sniper`
+          );
+        } catch (error) {
+          await ctx.reply('❌ Помилка створення фільтра. Спробуйте ще раз.');
+          logger.error('Filter creation error:', error);
+        }
         break;
+
+      default:
+        this.userStates.delete(ctx.from!.id);
+        await ctx.reply('❓ Невідома команда. Почніть спочатку: /start');
     }
   }
 
