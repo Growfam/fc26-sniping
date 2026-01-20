@@ -198,31 +198,71 @@ export class EAAuth extends EventEmitter {
 
   private async getLoginPage(): Promise<{ success: boolean; formData?: any; error?: string }> {
     try {
+      logger.info('[EAAuth] Getting login page...');
+      
       const response = await this.client.get(EA_ENDPOINTS.LOGIN_PAGE, {
         params: {
           client_id: 'FC26_JS_WEB_APP',
           redirect_uri: 'https://www.ea.com/ea-sports-fc/ultimate-team/web-app/auth.html',
           response_type: 'token',
           locale: 'en_US'
+        },
+        headers: {
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
         }
       });
 
-      const html = response.data;
-      const csrfMatch = html.match(/name="_csrf"\s+value="([^"]+)"/);
-      const executionMatch = html.match(/name="execution"\s+value="([^"]+)"/);
-
-      if (!csrfMatch) {
-        return { success: false, error: 'Не вдалося отримати CSRF token' };
+      const html = response.data as string;
+      
+      // Try multiple CSRF patterns
+      let csrf: string | null = null;
+      
+      // Pattern 1: name="_csrf" value="xxx"
+      const csrfMatch1 = html.match(/name=["']_csrf["']\s*value=["']([^"']+)["']/i);
+      if (csrfMatch1) csrf = csrfMatch1[1];
+      
+      // Pattern 2: value="xxx" name="_csrf"  
+      if (!csrf) {
+        const csrfMatch2 = html.match(/value=["']([^"']+)["']\s*name=["']_csrf["']/i);
+        if (csrfMatch2) csrf = csrfMatch2[1];
       }
+      
+      // Pattern 3: hidden input with _csrf
+      if (!csrf) {
+        const csrfMatch3 = html.match(/<input[^>]*name=["']_csrf["'][^>]*value=["']([^"']+)["']/i);
+        if (csrfMatch3) csrf = csrfMatch3[1];
+      }
+      
+      // Pattern 4: any input with _csrf anywhere
+      if (!csrf) {
+        const csrfMatch4 = html.match(/_csrf["'][^>]*value=["']([^"']+)["']/i);
+        if (csrfMatch4) csrf = csrfMatch4[1];
+      }
+
+      // Get execution token
+      let execution: string | null = null;
+      const execMatch = html.match(/name=["']execution["']\s*value=["']([^"']+)["']/i) ||
+                        html.match(/value=["']([^"']+)["']\s*name=["']execution["']/i);
+      if (execMatch) execution = execMatch[1];
+
+      if (!csrf) {
+        // Log part of HTML for debugging
+        logger.error('[EAAuth] CSRF not found. HTML snippet:', html.substring(0, 500));
+        return { success: false, error: 'Не вдалося отримати CSRF token. EA змінив сторінку логіну.' };
+      }
+
+      logger.info('[EAAuth] Got CSRF token successfully');
 
       return {
         success: true,
         formData: {
-          _csrf: csrfMatch[1],
-          execution: executionMatch ? executionMatch[1] : undefined
+          _csrf: csrf,
+          execution: execution
         }
       };
     } catch (error: any) {
+      logger.error('[EAAuth] Failed to get login page:', error.message);
       return { success: false, error: `Помилка завантаження: ${error.message}` };
     }
   }
@@ -371,6 +411,8 @@ export class EAAuth extends EventEmitter {
 
   private async getAccessToken(): Promise<{ success: boolean; accessToken?: string; error?: string }> {
     try {
+      logger.info('[EAAuth] Getting access token...');
+      
       const response = await this.client.get(EA_ENDPOINTS.ACCOUNTS_AUTH, {
         params: {
           client_id: 'FC26_JS_WEB_APP',
@@ -382,24 +424,41 @@ export class EAAuth extends EventEmitter {
       });
 
       const finalUrl = response.request?.res?.responseUrl || '';
+      logger.info(`[EAAuth] Final URL: ${finalUrl.substring(0, 100)}...`);
+      
       const tokenMatch = finalUrl.match(/access_token=([^&]+)/);
       
       if (tokenMatch) {
+        logger.info('[EAAuth] Access token obtained from URL');
         return { success: true, accessToken: tokenMatch[1] };
       }
 
       if (response.data?.access_token) {
+        logger.info('[EAAuth] Access token obtained from response');
         return { success: true, accessToken: response.data.access_token };
       }
 
-      return { success: false, error: 'Не вдалося отримати access token. Перевірте логін/пароль.' };
+      // Check if we need to login again
+      const html = typeof response.data === 'string' ? response.data : '';
+      if (html.includes('login') || html.includes('signin')) {
+        logger.warn('[EAAuth] Redirected to login page - session not established');
+        return { success: false, error: 'Сесія не збережена. Спробуйте ще раз.' };
+      }
+
+      logger.warn('[EAAuth] No access token found in response');
+      return { success: false, error: 'Не вдалося отримати access token. Можливо потрібна капча - відкрийте https://www.ea.com/ea-sports-fc/ultimate-team/web-app/' };
 
     } catch (error: any) {
       const location = error.response?.headers?.location || '';
+      logger.info(`[EAAuth] Error response, checking location: ${location.substring(0, 100)}`);
+      
       const tokenMatch = location.match(/access_token=([^&]+)/);
       if (tokenMatch) {
+        logger.info('[EAAuth] Access token obtained from error redirect');
         return { success: true, accessToken: tokenMatch[1] };
       }
+      
+      logger.error(`[EAAuth] getAccessToken error: ${error.message}`);
       return { success: false, error: `Помилка токена: ${error.message}` };
     }
   }

@@ -73,8 +73,10 @@ export class TelegramBot {
     this.bot.command('help', (ctx) => this.showHelp(ctx));
     this.bot.command('accounts', (ctx) => this.showAccounts(ctx));
     this.bot.command('add_account', (ctx) => this.startAddAccount(ctx));
+    this.bot.command('addaccount', (ctx) => this.startAddAccount(ctx)); // alias
     this.bot.command('filters', (ctx) => this.showFilters(ctx));
     this.bot.command('add_filter', (ctx) => this.startAddFilter(ctx));
+    this.bot.command('addfilter', (ctx) => this.startAddFilter(ctx)); // alias
     this.bot.command('status', (ctx) => this.showStatus(ctx));
     this.bot.command('risk', (ctx) => this.showRisk(ctx));
     this.bot.command('settings', (ctx) => this.showSettings(ctx));
@@ -116,23 +118,27 @@ export class TelegramBot {
       const state = this.userStates.get(ctx.from.id);
       if (!state) return;
 
-      const text = ctx.message.text.trim();
+      const message = ctx.message as any;
+      const text = (message?.text || '').trim();
+      
+      // Skip if it's a command
+      if (text.startsWith('/')) return;
 
       switch (state.step) {
         case 'email':
-          await this.handleEmailInput(ctx, text);
+          await this.handleEmailInput(ctx as any, text);
           break;
         case 'password':
-          await this.handlePasswordInput(ctx, text);
+          await this.handlePasswordInput(ctx as any, text);
           break;
         case 'filter_name':
-          await this.handleFilterName(ctx, text);
+          await this.handleFilterName(ctx as any, text);
           break;
         case 'filter_max_buy':
-          await this.handleFilterMaxBuy(ctx, text);
+          await this.handleFilterMaxBuy(ctx as any, text);
           break;
         case 'filter_sell_price':
-          await this.handleFilterSellPrice(ctx, text);
+          await this.handleFilterSellPrice(ctx as any, text);
           break;
       }
     });
@@ -143,14 +149,15 @@ export class TelegramBot {
   // ==========================================
 
   private async showWelcome(ctx: BotContext): Promise<void> {
+    logger.info(`[Bot] /start command from ${ctx.from?.id}`);
     await ctx.reply(
       `👋 *Вітаю у FC26 Sniper Bot v2.0!*\n\n` +
       `🔐 *Авторизація:* Email + Password + 2FA\n` +
       `🛡️ *Anti-Ban:* Захист від блокування\n` +
       `⚡ *Швидкість:* 7-15 сек між запитами\n\n` +
       `*Почати роботу:*\n` +
-      `1️⃣ /add_account - додати EA акаунт\n` +
-      `2️⃣ /add_filter - створити фільтр\n` +
+      `1️⃣ /add\\_account - додати EA акаунт\n` +
+      `2️⃣ /add\\_filter - створити фільтр\n` +
       `3️⃣ Запустити снайпер\n\n` +
       `📖 /help - всі команди`,
       { parse_mode: 'Markdown' }
@@ -158,14 +165,15 @@ export class TelegramBot {
   }
 
   private async showHelp(ctx: BotContext): Promise<void> {
+    logger.info(`[Bot] /help command from ${ctx.from?.id}`);
     await ctx.reply(
       `📖 *Команди бота:*\n\n` +
       `👤 *Акаунти:*\n` +
       `/accounts - список акаунтів\n` +
-      `/add_account - додати акаунт\n\n` +
+      `/add\\_account - додати акаунт\n\n` +
       `🎯 *Фільтри:*\n` +
       `/filters - список фільтрів\n` +
-      `/add_filter - додати фільтр\n\n` +
+      `/add\\_filter - додати фільтр\n\n` +
       `📊 *Статус:*\n` +
       `/status - статус бота\n` +
       `/risk - рівні ризику\n` +
@@ -254,6 +262,8 @@ export class TelegramBot {
   // ==========================================
 
   private async startAddAccount(ctx: BotContext): Promise<void> {
+    logger.info(`[Bot] /add_account command from ${ctx.from?.id}`);
+    
     this.userStates.set(ctx.from!.id, {
       step: 'email',
       data: {}
