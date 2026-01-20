@@ -98,7 +98,7 @@ export class EAAPI {
     this.platform = platform;
     this.cookieJar = new CookieJar();
 
-    // Platform-specific URLs
+    // Platform-specific URLs - ОНОВЛЕНО для FC 26
     const platformUrls: Record<string, string> = {
       'ps': 'https://utas.mob.v1.fut.ea.com',
       'xbox': 'https://utas.mob.v2.fut.ea.com',
@@ -112,11 +112,15 @@ export class EAAPI {
       timeout: 30000,
       headers: {
         'Accept': 'application/json',
+        'Accept-Encoding': 'gzip, deflate, br',
         'Accept-Language': 'en-US,en;q=0.9',
         'Content-Type': 'application/json',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Origin': 'https://www.ea.com',
         'Referer': 'https://www.ea.com/',
+        'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Windows"',
         'Sec-Fetch-Dest': 'empty',
         'Sec-Fetch-Mode': 'cors',
         'Sec-Fetch-Site': 'same-site'
@@ -151,15 +155,20 @@ export class EAAPI {
         personaId: cookies['personaId'] || '',
         nucleusId: cookies['nucleusId'] || '',
         sessionId: cookies['sid'] || cookies['sessionId'] || '',
-        phishingToken: cookies['phishing'] || '',
+        phishingToken: cookies['phishing'] || cookies['phishingToken'] || '',
         dob: cookies['dob'] || ''
       };
 
+      // Log session info for debugging
+      logger.info(`Session initialized: SID=${this.session.sessionId.substring(0, 8)}...`);
+
       // Verify session is valid
       const isValid = await this.verifySession();
-      
+
       if (isValid) {
-        logger.info(`EA Session initialized for account ${this.accountId}`);
+        logger.info(`EA Session verified for account ${this.accountId}`);
+      } else {
+        logger.warn(`EA Session verification failed for account ${this.accountId}`);
       }
 
       return isValid;
@@ -172,8 +181,10 @@ export class EAAPI {
   async verifySession(): Promise<boolean> {
     try {
       const response = await this.getCredits();
+      logger.info(`Session verified, credits: ${response.credits}`);
       return response.credits !== undefined;
-    } catch (error) {
+    } catch (error: any) {
+      logger.error(`Session verification error: ${error.message}`);
       return false;
     }
   }
@@ -221,18 +232,24 @@ export class EAAPI {
   }
 
   // ==========================================
-  // REQUEST HELPERS
+  // REQUEST HELPERS - ВИПРАВЛЕНО!
   // ==========================================
   private getHeaders(): Record<string, string> {
     if (!this.session) {
       throw new Error('Session not initialized');
     }
 
-    return {
-      'X-UT-SID': this.session.sessionId,
-      'X-UT-PHISHING-TOKEN': this.session.phishingToken,
-      'X-Requested-With': 'ShockwaveFlash'
+    // ✅ ВИПРАВЛЕННЯ: Тільки обов'язкові headers
+    const headers: Record<string, string> = {
+      'X-UT-SID': this.session.sessionId
     };
+
+    // Додаємо phishing token ТІЛЬКИ якщо він є
+    if (this.session.phishingToken && this.session.phishingToken.length > 0) {
+      headers['X-UT-PHISHING-TOKEN'] = this.session.phishingToken;
+    }
+
+    return headers;
   }
 
   private async request<T>(
@@ -243,7 +260,9 @@ export class EAAPI {
     await this.checkRateLimit();
 
     const url = `/ut/game/fc26${endpoint}`;
-    
+
+    logger.debug(`EA API Request: ${method} ${url}`);
+
     try {
       const response: AxiosResponse<T> = await this.client.request({
         method,
@@ -254,6 +273,10 @@ export class EAAPI {
 
       return response.data;
     } catch (error: any) {
+      // Log more details for debugging
+      if (error.response) {
+        logger.error(`EA API Error: ${error.response.status} - ${JSON.stringify(error.response.data)}`);
+      }
       throw this.handleError(error);
     }
   }
@@ -262,6 +285,8 @@ export class EAAPI {
     if (error.response) {
       const status = error.response.status;
       const data = error.response.data;
+
+      logger.error(`EA API Error Response: ${status}`, data);
 
       switch (status) {
         case 401:
@@ -310,7 +335,7 @@ export class EAAPI {
     await this.randomDelay();
 
     const params = new URLSearchParams();
-    
+
     params.append('start', String(filter.start || 0));
     params.append('num', String(filter.count || 21));
     params.append('type', filter.type || 'player');
@@ -483,7 +508,7 @@ export class EAAPI {
     const taxMultiplier = 0.95;
     const targetProfit = buyPrice * profitMargin;
     const sellPrice = Math.ceil((buyPrice + targetProfit) / taxMultiplier);
-    
+
     // Round to valid price
     return EAAPI.roundToValidPrice(sellPrice);
   }
