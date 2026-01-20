@@ -218,7 +218,7 @@ export class TelegramBot {
     if ('editMessageText' in ctx) {
       await (ctx as any).editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
     } else {
-      await ctx.reply(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+      await (ctx as any).reply(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
     }
   }
 
@@ -358,7 +358,8 @@ export class TelegramBot {
   }
 
   private async handle2FACommand(ctx: BotContext): Promise<void> {
-    const text = ctx.message?.text || '';
+    const message = ctx.message as any;
+    const text = message?.text || '';
     const code = text.replace('/2fa', '').trim();
 
     if (!code) {
@@ -514,7 +515,7 @@ export class TelegramBot {
     if ('editMessageText' in ctx) {
       await (ctx as any).editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
     } else {
-      await ctx.reply(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
+      await (ctx as any).reply(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
     }
   }
 

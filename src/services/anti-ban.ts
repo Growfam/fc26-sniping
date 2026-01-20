@@ -667,6 +667,38 @@ export class AntiBanService extends EventEmitter {
   }
 
   /**
+   * Get stats object for programmatic use
+   */
+  getStats(accountId: string): {
+    riskLevel: RiskLevel;
+    riskPercent: number;
+    requestsThisHour: number;
+    searchesThisHour: number;
+    purchasesThisHour: number;
+    errorsThisHour: number;
+  } | null {
+    const stats = this.sessions.get(accountId);
+    if (!stats) return null;
+
+    const riskPercent = this.getRiskPercentage(accountId);
+    let riskLevel: RiskLevel;
+    
+    if (riskPercent < 30) riskLevel = RiskLevel.LOW;
+    else if (riskPercent < 60) riskLevel = RiskLevel.MEDIUM;
+    else if (riskPercent < 85) riskLevel = RiskLevel.HIGH;
+    else riskLevel = RiskLevel.CRITICAL;
+
+    return {
+      riskLevel,
+      riskPercent,
+      requestsThisHour: stats.requestsThisHour,
+      searchesThisHour: stats.searchesThisHour,
+      purchasesThisHour: stats.purchasesThisHour,
+      errorsThisHour: stats.errorsThisHour
+    };
+  }
+
+  /**
    * Update configuration
    */
   updateConfig(newConfig: Partial<AntiBanConfig>): void {
