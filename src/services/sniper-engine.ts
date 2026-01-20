@@ -489,17 +489,18 @@ export class SniperEngine extends EventEmitter {
   ): Promise<void> {
     try {
       await db.recordTransaction({
-        user_id: session.userId,
-        ea_account_id: session.accountId,
-        filter_id: filter.id,
-        player_id: item.itemData.assetId,
-        player_name: EAAPI.getPlayerName(item),
-        buy_price: result.buyPrice!,
-        sell_price: result.sellPrice || null,
-        profit: null, // Calculated when sold
-        status: 'bought',
-        trade_id: String(item.tradeId)
-      });
+  user_id: session.userId,
+  ea_account_id: session.accountId,
+  filter_id: filter.id,
+  player_id: item.itemData.assetId,
+  player_name: EAAPI.getPlayerName(item),
+  buy_price: result.buyPrice!,
+  sell_price: result.sellPrice || null,
+  profit: null,
+  status: 'bought',
+  trade_id: String(item.tradeId),
+  sold_at: null
+});
     } catch (error) {
       logger.error('Failed to record transaction:', error);
     }

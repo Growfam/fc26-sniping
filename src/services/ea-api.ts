@@ -85,7 +85,7 @@ export class EAAPI {
   private cookieJar: CookieJar;
   private session: EASession | null = null;
   private accountId: string;
-  private platform: string;
+  public platform: string;
   private baseUrl: string;
 
   // Request tracking

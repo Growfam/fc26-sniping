@@ -11,11 +11,8 @@ import { logger } from '../utils/logger';
 // ==========================================
 interface BotContext extends Context {
   user?: User;
-  state?: {
-    step?: string;
-    data?: any;
-  };
 }
+
 
 // ==========================================
 // BOT INSTANCE
