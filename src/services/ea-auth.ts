@@ -53,11 +53,26 @@ const PLATFORM_ENDPOINTS: Record<string, string> = {
 };
 
 const EA_ENDPOINTS = {
-  LOGIN_PAGE: 'https://signin.ea.com/p/juno/login',
-  LOGIN_SUBMIT: 'https://signin.ea.com/p/juno/login',
-  TWO_FACTOR: 'https://signin.ea.com/p/juno/tfa',
+  // Step 1: Start auth flow here - will redirect to login page with execution token
   ACCOUNTS_AUTH: 'https://accounts.ea.com/connect/auth',
+  // Step 2: Login page (need execution token from redirect)
+  LOGIN_PAGE: 'https://signin.ea.com/p/juno/login',
+  // Step 3: 2FA page
+  TWO_FACTOR: 'https://signin.ea.com/p/juno/tfa',
+  // Step 4: Get identity
   GATEWAY: 'https://gateway.ea.com/proxy/identity/pids/me'
+};
+
+const AUTH_PARAMS = {
+  hide_create: 'true',
+  display: 'web2/login',
+  scope: 'basic.identity offline signin basic.entitlement basic.persona',
+  release_type: 'prod',
+  response_type: 'token',
+  redirect_uri: 'https://www.ea.com/ea-sports-fc/ultimate-team/web-app/auth.html',
+  locale: 'en_US',
+  prompt: 'login',
+  client_id: 'FC26_JS_WEB_APP'
 };
 
 // ==========================================
@@ -193,76 +208,129 @@ export class EAAuth extends EventEmitter {
   }
 
   // ==========================================
-  // STEP 1: GET LOGIN PAGE
+  // STEP 1: GET LOGIN PAGE (with execution token)
   // ==========================================
 
   private async getLoginPage(): Promise<{ success: boolean; formData?: any; error?: string }> {
     try {
-      logger.info('[EAAuth] Getting login page...');
+      logger.info('[EAAuth] Step 1: Getting execution token from accounts.ea.com...');
       
-      const response = await this.client.get(EA_ENDPOINTS.LOGIN_PAGE, {
-        params: {
-          client_id: 'FC26_JS_WEB_APP',
-          redirect_uri: 'https://www.ea.com/ea-sports-fc/ultimate-team/web-app/auth.html',
-          response_type: 'token',
-          locale: 'en_US'
-        },
+      // First request to accounts.ea.com - it will redirect to signin.ea.com with execution token
+      const authResponse = await this.client.get(EA_ENDPOINTS.ACCOUNTS_AUTH, {
+        params: AUTH_PARAMS,
+        maxRedirects: 0, // Don't follow redirects automatically
+        validateStatus: (status) => status < 400 || status === 302 || status === 303
+      });
+
+      let loginUrl: string | null = null;
+
+      // Check for redirect
+      if (authResponse.status === 302 || authResponse.status === 303) {
+        loginUrl = authResponse.headers.location;
+        logger.info(`[EAAuth] Got redirect to: ${loginUrl?.substring(0, 100)}...`);
+      }
+
+      if (!loginUrl) {
+        // Try to find redirect in response
+        const html = authResponse.data as string;
+        const redirectMatch = html.match(/location\.href\s*=\s*["']([^"']+)["']/i) ||
+                              html.match(/window\.location\s*=\s*["']([^"']+)["']/i);
+        if (redirectMatch) {
+          loginUrl = redirectMatch[1];
+        }
+      }
+
+      if (!loginUrl) {
+        logger.error('[EAAuth] No redirect URL found');
+        return { success: false, error: 'EA не повернув URL логіну' };
+      }
+
+      // Now fetch the actual login page
+      logger.info('[EAAuth] Step 2: Fetching login page...');
+      
+      const loginResponse = await this.client.get(loginUrl, {
         headers: {
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
           'Accept-Language': 'en-US,en;q=0.9',
-        }
+        },
+        maxRedirects: 5
       });
 
-      const html = response.data as string;
+      const html = loginResponse.data as string;
+      
+      // Log HTML snippet for debugging
+      logger.info(`[EAAuth] Login page size: ${html.length} bytes`);
+      
+      // Extract execution token from URL or form
+      let execution: string | null = null;
+      
+      // From URL
+      const execUrlMatch = loginUrl.match(/execution=([^&]+)/);
+      if (execUrlMatch) {
+        execution = execUrlMatch[1];
+        logger.info(`[EAAuth] Got execution from URL: ${execution.substring(0, 20)}...`);
+      }
+      
+      // From form
+      if (!execution) {
+        const execFormMatch = html.match(/name=["']execution["'][^>]*value=["']([^"']+)["']/i) ||
+                              html.match(/value=["']([^"']+)["'][^>]*name=["']execution["']/i);
+        if (execFormMatch) {
+          execution = execFormMatch[1];
+          logger.info(`[EAAuth] Got execution from form: ${execution.substring(0, 20)}...`);
+        }
+      }
       
       // Try multiple CSRF patterns
       let csrf: string | null = null;
       
-      // Pattern 1: name="_csrf" value="xxx"
-      const csrfMatch1 = html.match(/name=["']_csrf["']\s*value=["']([^"']+)["']/i);
-      if (csrfMatch1) csrf = csrfMatch1[1];
+      const csrfPatterns = [
+        /name=["']_csrf["'][^>]*value=["']([^"']+)["']/i,
+        /value=["']([^"']+)["'][^>]*name=["']_csrf["']/i,
+        /<input[^>]*name=["']_csrf["'][^>]*value=["']([^"']+)["']/i,
+        /_csrf["'][^>]*value=["']([^"']+)["']/i,
+        /name="_csrf"\s+value="([^"]+)"/,
+        /csrf.*?value=["']([^"']+)["']/i
+      ];
       
-      // Pattern 2: value="xxx" name="_csrf"  
-      if (!csrf) {
-        const csrfMatch2 = html.match(/value=["']([^"']+)["']\s*name=["']_csrf["']/i);
-        if (csrfMatch2) csrf = csrfMatch2[1];
+      for (const pattern of csrfPatterns) {
+        const match = html.match(pattern);
+        if (match) {
+          csrf = match[1];
+          logger.info(`[EAAuth] Got CSRF token: ${csrf.substring(0, 20)}...`);
+          break;
+        }
       }
-      
-      // Pattern 3: hidden input with _csrf
-      if (!csrf) {
-        const csrfMatch3 = html.match(/<input[^>]*name=["']_csrf["'][^>]*value=["']([^"']+)["']/i);
-        if (csrfMatch3) csrf = csrfMatch3[1];
-      }
-      
-      // Pattern 4: any input with _csrf anywhere
-      if (!csrf) {
-        const csrfMatch4 = html.match(/_csrf["'][^>]*value=["']([^"']+)["']/i);
-        if (csrfMatch4) csrf = csrfMatch4[1];
-      }
-
-      // Get execution token
-      let execution: string | null = null;
-      const execMatch = html.match(/name=["']execution["']\s*value=["']([^"']+)["']/i) ||
-                        html.match(/value=["']([^"']+)["']\s*name=["']execution["']/i);
-      if (execMatch) execution = execMatch[1];
 
       if (!csrf) {
         // Log part of HTML for debugging
-        logger.error('[EAAuth] CSRF not found. HTML snippet:', html.substring(0, 500));
-        return { success: false, error: 'Не вдалося отримати CSRF token. EA змінив сторінку логіну.' };
+        const formSection = html.match(/<form[\s\S]*?<\/form>/i);
+        logger.error('[EAAuth] CSRF not found. Form HTML:', formSection ? formSection[0].substring(0, 500) : 'No form found');
+        logger.error('[EAAuth] Full HTML snippet:', html.substring(0, 1000));
+        return { success: false, error: 'Не вдалося отримати CSRF token' };
       }
 
-      logger.info('[EAAuth] Got CSRF token successfully');
+      if (!execution) {
+        logger.error('[EAAuth] Execution token not found');
+        return { success: false, error: 'Не вдалося отримати execution token' };
+      }
+
+      logger.info('[EAAuth] Successfully got login page with CSRF and execution tokens');
 
       return {
         success: true,
         formData: {
           _csrf: csrf,
-          execution: execution
+          execution: execution,
+          loginUrl: loginUrl
         }
       };
     } catch (error: any) {
       logger.error('[EAAuth] Failed to get login page:', error.message);
+      if (error.response) {
+        logger.error('[EAAuth] Response status:', error.response.status);
+        logger.error('[EAAuth] Response headers:', JSON.stringify(error.response.headers));
+      }
       return { success: false, error: `Помилка завантаження: ${error.message}` };
     }
   }
@@ -277,7 +345,12 @@ export class EAAuth extends EventEmitter {
     formData: any
   ): Promise<{ success: boolean; requires2FA?: boolean; twoFactorMethod?: string; formData?: any; error?: string }> {
     try {
-      const response = await this.client.post(EA_ENDPOINTS.LOGIN_SUBMIT, new URLSearchParams({
+      // Use the login URL from formData, or construct one
+      const submitUrl = formData.loginUrl || EA_ENDPOINTS.LOGIN_PAGE;
+      
+      logger.info(`[EAAuth] Submitting credentials to: ${submitUrl.substring(0, 60)}...`);
+      
+      const response = await this.client.post(submitUrl, new URLSearchParams({
         email,
         password,
         _csrf: formData._csrf,
@@ -285,7 +358,9 @@ export class EAAuth extends EventEmitter {
         _eventId: 'submit'
       }).toString(), {
         headers: {
-          'Content-Type': 'application/x-www-form-urlencoded'
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Origin': 'https://signin.ea.com',
+          'Referer': submitUrl
         },
         maxRedirects: 0,
         validateStatus: (status) => status < 500
@@ -414,12 +489,7 @@ export class EAAuth extends EventEmitter {
       logger.info('[EAAuth] Getting access token...');
       
       const response = await this.client.get(EA_ENDPOINTS.ACCOUNTS_AUTH, {
-        params: {
-          client_id: 'FC26_JS_WEB_APP',
-          redirect_uri: 'https://www.ea.com/ea-sports-fc/ultimate-team/web-app/auth.html',
-          response_type: 'token',
-          locale: 'en_US'
-        },
+        params: AUTH_PARAMS,
         maxRedirects: 10
       });
 
