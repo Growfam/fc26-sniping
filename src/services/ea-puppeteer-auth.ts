@@ -239,15 +239,16 @@ class EAPuppeteerAuth {
       await this.sleep(5000);
       
       // Listen for network requests to get SID
-      const sid = await page.evaluate(() => {
-        // Try to get from localStorage or sessionStorage
-        const keys = ['FUTWebSID', 'sid', 'ut-sid'];
-        for (const key of keys) {
-          const val = (window as any).localStorage?.getItem(key) || (window as any).sessionStorage?.getItem(key);
-          if (val) return val;
-        }
-        return '';
-      });
+      const sid = await page.evaluate(`
+        (function() {
+          const keys = ['FUTWebSID', 'sid', 'ut-sid'];
+          for (const key of keys) {
+            const val = localStorage.getItem(key) || sessionStorage.getItem(key);
+            if (val) return val;
+          }
+          return '';
+        })()
+      `);
 
       if (sid) {
         logger.info('[PuppeteerAuth] Got SID from storage');
