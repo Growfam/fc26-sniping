@@ -852,39 +852,74 @@ export class TelegramBot {
         break;
 
       case 'update_cookies':
-  try {
-    let sid = text.trim();
+        try {
+          let sid = text.trim();
 
-    if (text.includes('{')) {
-      const parsed = JSON.parse(text);
-      sid = parsed.sid || parsed['X-UT-SID'] || text;
-    }
+          if (text.includes('{')) {
+            const parsed = JSON.parse(text);
+            sid = parsed.sid || parsed['X-UT-SID'] || text;
+          }
 
-    const sidRegex = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
-    if (!sidRegex.test(sid)) {
-      await ctx.reply(
-        '❌ Невірний формат SID!\n\n' +
-        'SID має виглядати так:\n' +
-        'f1888c19-c261-4e8c-b49e-1e202c4a872f'
-      );
-      return;
-    }
+          const sidRegex = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+          if (!sidRegex.test(sid)) {
+            await ctx.reply(
+              '❌ Невірний формат SID!\n\n' +
+              'SID має виглядати так:\n' +
+              'f1888c19-c261-4e8c-b49e-1e202c4a872f'
+            );
+            return;
+          }
 
-    const cookies = { sid: sid };
+          await ctx.reply('⏳ Перевіряю новий SID...');
 
-    await db.updateEAAccountSession(state.data.accountId, { cookies });
+          const cookies = { sid: sid };
 
-    this.userStates.delete(ctx.from!.id);
+          // Оновлюємо cookies в БД
+          await db.updateEAAccountSession(state.data.accountId, { cookies });
 
-    await ctx.reply('✅ Cookies успішно оновлено!');
-  } catch (error) {
-    await ctx.reply(
-      '❌ Помилка!\n\n' +
-      'Надішліть SID у форматі:\n' +
-      'f1888c19-c261-4e8c-b49e-1e202c4a872f'
-    );
-  }
-  break;
+          // Видаляємо старий інстанс API
+          EAAPIFactory.removeInstance(state.data.accountId);
+
+          // Перевіряємо новий SID та отримуємо баланс
+          let coins = 0;
+          let sessionValid = false;
+
+          try {
+            const api = await EAAPIFactory.getInstance(state.data.accountId);
+            if (api) {
+              const credits = await api.getCredits();
+              coins = credits.credits;
+              sessionValid = true;
+
+              // Оновлюємо баланс в БД
+              await db.updateEAAccountSession(state.data.accountId, { coins: coins });
+            }
+          } catch (apiError) {
+            logger.warn('Could not verify EA session:', apiError);
+          }
+
+          this.userStates.delete(ctx.from!.id);
+
+          if (sessionValid) {
+            await ctx.reply(
+              '✅ Cookies оновлено!\n\n' +
+              '💰 Баланс: ' + coins.toLocaleString() + ' монет\n' +
+              '🔑 SID: ' + sid.substring(0, 8) + '...'
+            );
+          } else {
+            await ctx.reply(
+              '⚠️ Cookies збережено, але перевірка не вдалась.\n\n' +
+              'Можливо SID застарів.'
+            );
+          }
+        } catch (error) {
+          await ctx.reply(
+            '❌ Помилка!\n\n' +
+            'Надішліть SID у форматі:\n' +
+            'f1888c19-c261-4e8c-b49e-1e202c4a872f'
+          );
+        }
+        break;
 
       case 'add_filter_name':
         state.data.name = text;
