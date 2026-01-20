@@ -326,40 +326,49 @@ export class EAAuth extends EventEmitter {
 
       logger.info(`[EAAuth] After password, status: ${passResponse.status}, URL: ${finalUrl.substring(0, 80)}`);
 
+      // Check execution step (s1=email, s2=password, s3+=2FA or success)
+      const execMatch = finalUrl.match(/execution=e\d+s(\d+)/);
+      const execStep = execMatch ? parseInt(execMatch[1]) : 0;
+      logger.info(`[EAAuth] Execution step: ${execStep}`);
+
       // Success - got access token
       if (finalUrl.includes('access_token=') || location.includes('access_token=')) {
         logger.info('[EAAuth] ✅ Got access token!');
         return { success: true };
       }
 
-      // Need 2FA
+      // If we reached step 3+, password was accepted! This is 2FA page
+      if (execStep >= 3) {
+        logger.info('[EAAuth] ✅ Password accepted! Now on 2FA page (step 3+)');
+        return { success: true, requires2FA: true, tfaUrl: finalUrl };
+      }
+
+      // Explicit 2FA detection
       if (finalUrl.includes('/tfa') || location.includes('/tfa') ||
           html.includes('twoFactorCode') || html.includes('security code') ||
-          html.includes('Verify your identity') || html.includes('Enter the code')) {
-        logger.info('[EAAuth] 2FA required');
-
-        const tfaUrl = finalUrl.includes('/tfa') ? finalUrl :
-                       (location.startsWith('http') ? location : 'https://signin.ea.com' + location);
-
-        return { success: true, requires2FA: true, tfaUrl };
+          html.includes('Verify your identity') || html.includes('Enter the code') ||
+          html.includes('One-Time Code') || html.includes('code we sent')) {
+        logger.info('[EAAuth] 2FA required (explicit)');
+        return { success: true, requires2FA: true, tfaUrl: finalUrl };
       }
 
-      // Error messages
-      if (html.includes('Your credentials are incorrect') ||
-          html.includes('credentials') && html.includes('incorrect') ||
-          html.includes('wrong password')) {
-        return { success: false, error: 'Невірний пароль' };
+      // Error messages - only if still on step 2
+      if (execStep <= 2) {
+        if (html.includes('Your credentials are incorrect') ||
+            html.includes('credentials') && html.includes('incorrect') ||
+            html.includes('wrong password')) {
+          return { success: false, error: 'Невірний пароль' };
+        }
+
+        if (html.includes('locked') || html.includes('suspended') || html.includes('banned')) {
+          return { success: false, error: 'Акаунт заблоковано' };
+        }
       }
 
-      if (html.includes('locked') || html.includes('suspended') || html.includes('banned')) {
-        return { success: false, error: 'Акаунт заблоковано' };
-      }
-
-      // Still on login page?
-      if (finalUrl.includes('signin.ea.com') && (html.includes('password') || html.includes('login'))) {
-        logger.warn('[EAAuth] Still on login page');
-        logger.info(`[EAAuth] HTML snippet: ${html.substring(0, 500)}`);
-        return { success: false, error: 'Не вдалося увійти. Перевірте пароль.' };
+      // If still on signin page but step didn't change - something wrong
+      if (finalUrl.includes('signin.ea.com') && execStep <= 2) {
+        logger.warn('[EAAuth] Still on login page, step did not advance');
+        return { success: false, error: 'Не вдалося увійти. Перевірте дані.' };
       }
 
       logger.info('[EAAuth] Credentials submitted successfully');
