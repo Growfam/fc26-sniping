@@ -12,21 +12,18 @@
     'use strict';
 
     // ==========================================
-    // CONFIG - ЗМІНІТЬ ЦІ ЗНАЧЕННЯ
+    // CONFIG
     // ==========================================
     const CONFIG = {
-        // Supabase - отримайте на supabase.com → Settings → API
-        SUPABASE_URL: 'https://YOUR_PROJECT.supabase.co',
-        SUPABASE_KEY: 'YOUR_ANON_KEY',
-        
-        // Telegram ID - отримайте через /start в боті
-        TELEGRAM_USER_ID: 123456789,
-        
+        SUPABASE_URL: 'https://gvthriuorgvwnejhwxzf.supabase.co',
+        SUPABASE_KEY: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd2dGhyaXVvcmd2d25lamh3eHpmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzY5NTg0OTksImV4cCI6MjA1MjUzNDQ5OX0.KwVgDI-c_XNSvR8kGbE5oadX-ZGXSj5pCWghNj3gJys',
+        TELEGRAM_USER_ID: 7066583465,
+
         // Затримки (мс)
         SEARCH_DELAY_MIN: 7000,
         SEARCH_DELAY_MAX: 15000,
         BUY_DELAY: 300,
-        
+
         // Anti-ban
         MAX_SEARCHES_PER_HOUR: 200,
         PAUSE_AFTER_BUY: 30000,
@@ -118,7 +115,7 @@
             <h3>⚡ FC26 SNIPER</h3>
             <div id="sniper-status" class="status stopped">ЗУПИНЕНО</div>
             <div class="stats">
-                🔍 Пошуків: <span id="stat-searches">0</span> | 
+                🔍 Пошуків: <span id="stat-searches">0</span> |
                 ✅ Куплено: <span id="stat-bought">0</span><br>
                 💰 Профіт: <span id="stat-profit">0</span>
             </div>
@@ -171,8 +168,8 @@
         }
         el.innerHTML = filters.map(f => `
             <div class="filter-item">
-                ${f.is_active ? '✅' : '❌'} <b>${f.player_name || 'Фільтр'}</b> | 
-                Max: ${f.max_buy_price?.toLocaleString()} | 
+                ${f.is_active ? '✅' : '❌'} <b>${f.player_name || 'Фільтр'}</b> |
+                Max: ${f.max_buy_price?.toLocaleString()} |
                 Sell: ${f.sell_price?.toLocaleString()}
             </div>
         `).join('');
@@ -193,7 +190,7 @@
             }
         };
         if (body) options.body = JSON.stringify(body);
-        
+
         const response = await fetch(url, options);
         return response.json();
     }
@@ -245,7 +242,6 @@
     // FUT WEB APP API
     // ==========================================
     function getServices() {
-        // FUT Web App зберігає сервіси глобально
         return window.services || window.APP_MAIN_CORE?.services;
     }
 
@@ -261,12 +257,11 @@
                 const searchCriteria = new UTSearchCriteriaDTO();
                 searchCriteria.type = 'player';
                 searchCriteria.count = 21;
-                
+
                 if (filter.max_buy_price) {
                     searchCriteria.maxBuy = filter.max_buy_price;
                 }
-                
-                // Якщо вказано імʼя - шукаємо по ньому (потрібен player_id)
+
                 if (filter.player_id) {
                     searchCriteria.defId = [filter.player_id];
                 }
@@ -328,7 +323,6 @@
     async function sniperLoop() {
         if (!isRunning) return;
 
-        // Anti-ban check
         if (searchesThisHour >= CONFIG.MAX_SEARCHES_PER_HOUR) {
             log('⚠️ Ліміт пошуків. Пауза 10 хв...');
             await sleep(600000);
@@ -336,7 +330,7 @@
         }
 
         const activeFilters = filters.filter(f => f.is_active);
-        
+
         for (const filter of activeFilters) {
             if (!isRunning) break;
 
@@ -350,35 +344,34 @@
 
                 for (const item of items) {
                     if (!isRunning) break;
-                    
+
                     const buyNow = item._auction?.buyNowPrice;
                     if (!buyNow || buyNow > filter.max_buy_price) continue;
 
                     const playerName = item._staticData?.name || 'Гравець';
                     log(`💰 ${playerName} за ${buyNow.toLocaleString()}!`);
                     stats.found++;
-                    
+
                     try {
                         await sleep(CONFIG.BUY_DELAY);
                         await buyPlayer(item, filter.max_buy_price);
-                        
+
                         stats.bought++;
                         const profit = (filter.sell_price || buyNow) - buyNow - Math.floor((filter.sell_price || buyNow) * 0.05);
                         stats.profit += profit;
-                        
+
                         log(`✅ КУПЛЕНО! +${profit.toLocaleString()}`);
                         await logPurchase(playerName, buyNow, filter.sell_price || buyNow);
                         await saveStats();
-                        
-                        // Pause after buy
+
                         log(`⏸️ Пауза ${CONFIG.PAUSE_AFTER_BUY/1000}с...`);
                         await sleep(CONFIG.PAUSE_AFTER_BUY);
-                        
+
                     } catch (buyErr) {
                         stats.errors++;
                         log(`❌ ${buyErr.message}`);
                     }
-                    
+
                     updateUI();
                 }
 
@@ -387,13 +380,11 @@
                 log(`❌ ${e.message}`);
             }
 
-            // Delay between filters
             if (isRunning) {
                 await sleep(randomDelay(CONFIG.SEARCH_DELAY_MIN, CONFIG.SEARCH_DELAY_MAX));
             }
         }
 
-        // Next iteration
         if (isRunning) {
             setTimeout(sniperLoop, 1000);
         }
@@ -408,7 +399,7 @@
             log('❌ FUT не завантажено. Оновіть сторінку.');
             return;
         }
-        
+
         isRunning = true;
         log('▶️ Снайпер запущено!');
         updateUI();
@@ -427,10 +418,9 @@
     // ==========================================
     function init() {
         console.log('[FC26 Sniper] Initializing...');
-        
-        // Wait for FUT to load
+
         const checkReady = setInterval(() => {
-            if (document.querySelector('.ut-navigation-bar-view') || 
+            if (document.querySelector('.ut-navigation-bar-view') ||
                 document.querySelector('.ut-home-view') ||
                 document.querySelector('.ut-hub-view')) {
                 clearInterval(checkReady);
@@ -440,11 +430,9 @@
             }
         }, 1000);
 
-        // Reset hourly counter
         setInterval(() => { searchesThisHour = 0; }, 3600000);
     }
 
-    // Start
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', init);
     } else {
