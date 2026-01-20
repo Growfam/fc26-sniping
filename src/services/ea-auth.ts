@@ -343,6 +343,14 @@ export class EAAuth extends EventEmitter {
       // If we reached step 3+, password was accepted! This is 2FA page
       if (execStep >= 3) {
         logger.info('[EAAuth] ✅ Password accepted! Now on 2FA page (step 3+)');
+
+        // Try to send verification code automatically
+        const sendResult = await this.requestSendCode(finalUrl, html);
+        if (sendResult.newUrl) {
+          logger.info('[EAAuth] Code send requested, new URL: ' + sendResult.newUrl.substring(0, 60));
+          return { success: true, requires2FA: true, tfaUrl: sendResult.newUrl };
+        }
+
         return { success: true, requires2FA: true, tfaUrl: finalUrl };
       }
 
@@ -380,6 +388,77 @@ export class EAAuth extends EventEmitter {
     } catch (error: any) {
       logger.error('[EAAuth] Submit error:', error.message);
       return { success: false, error: `Помилка входу: ${error.message}` };
+    }
+  }
+
+  // ==========================================
+  // STEP 2.5: REQUEST SEND VERIFICATION CODE
+  // ==========================================
+
+  private async requestSendCode(tfaUrl: string, html: string): Promise<{ newUrl?: string }> {
+    try {
+      logger.info('[EAAuth] Requesting verification code to be sent...');
+
+      // Check if we need to select a method first (email vs app)
+      // Look for "Send code" or method selection buttons
+      const needsMethodSelection = html.includes('codeType') ||
+                                    html.includes('EMAIL_') ||
+                                    html.includes('send') && html.includes('code');
+
+      if (needsMethodSelection) {
+        logger.info('[EAAuth] Selecting email verification method...');
+
+        // Try to submit with email method selected
+        const sendResponse = await this.client.post(tfaUrl, new URLSearchParams({
+          codeType: 'EMAIL',
+          _eventId: 'submit'
+        }).toString(), {
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Origin': 'https://signin.ea.com',
+            'Referer': tfaUrl
+          },
+          maxRedirects: 5,
+          validateStatus: () => true
+        });
+
+        const newUrl = sendResponse.request?.res?.responseUrl || tfaUrl;
+        const newHtml = typeof sendResponse.data === 'string' ? sendResponse.data : '';
+
+        // Check if we advanced to code input page
+        const newExecMatch = newUrl.match(/execution=e\d+s(\d+)/);
+        const newStep = newExecMatch ? parseInt(newExecMatch[1]) : 0;
+
+        if (newStep > 3 || newHtml.includes('twoFactorCode') || newHtml.includes('Enter the code')) {
+          logger.info('[EAAuth] ✅ Code send request successful, now on code input page');
+          return { newUrl };
+        }
+      }
+
+      // Try alternative: just submit the form to trigger code send
+      const sendResponse = await this.client.post(tfaUrl, new URLSearchParams({
+        _eventId: 'submit'
+      }).toString(), {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Origin': 'https://signin.ea.com',
+          'Referer': tfaUrl
+        },
+        maxRedirects: 5,
+        validateStatus: () => true
+      });
+
+      const newUrl = sendResponse.request?.res?.responseUrl;
+      if (newUrl && newUrl !== tfaUrl) {
+        logger.info('[EAAuth] Form submitted, new URL received');
+        return { newUrl };
+      }
+
+      return {};
+
+    } catch (error: any) {
+      logger.warn('[EAAuth] Failed to request code send:', error.message);
+      return {};
     }
   }
 
