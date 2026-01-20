@@ -324,9 +324,33 @@ export class EAAPI {
   /**
    * Get current coins balance
    */
-  async getCredits(): Promise<{ credits: number }> {
-    return this.request<{ credits: number }>('GET', '/user/credits');
+async getCredits(): Promise<{ credits: number }> {
+  const response = await this.request<any>('GET', '/user/credits');
+
+  // EA може повертати в різних форматах
+  let credits = 0;
+
+  if (typeof response === 'object') {
+    // Формат: { credits: 123 }
+    if (response.credits !== undefined) {
+      credits = response.credits;
+    }
+    // Формат: { userInfo: { credits: 123 } }
+    else if (response.userInfo?.credits !== undefined) {
+      credits = response.userInfo.credits;
+    }
+    // Формат: { currencies: [{ name: 'COINS', funds: 123 }] }
+    else if (response.currencies) {
+      const coins = response.currencies.find((c: any) => c.name === 'COINS');
+      if (coins) credits = coins.funds;
+    }
   }
+
+  logger.info(`Credits response: ${JSON.stringify(response).substring(0, 200)}`);
+  logger.info(`Parsed credits: ${credits}`);
+
+  return { credits };
+}
 
   /**
    * Search transfer market
