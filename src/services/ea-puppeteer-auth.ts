@@ -239,7 +239,7 @@ class EAPuppeteerAuth {
       await this.sleep(5000);
       
       // Listen for network requests to get SID
-      const sid = await page.evaluate(`
+      const sid: string = await page.evaluate(`
         (function() {
           const keys = ['FUTWebSID', 'sid', 'ut-sid'];
           for (const key of keys) {
@@ -248,7 +248,7 @@ class EAPuppeteerAuth {
           }
           return '';
         })()
-      `);
+      `) as string;
 
       if (sid) {
         logger.info('[PuppeteerAuth] Got SID from storage');
